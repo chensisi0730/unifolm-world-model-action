@@ -127,21 +127,27 @@ def g1_image_client_default_factory():
 
 
 def usb_camera_default_factory():
+    """
+    UVC + Realsense D435i 混合配置:
+      - cam_high: RealSense D435i RGB (serial_number: 252443060733, /dev/video8)
+      - cam_left_wrist: UVC USB Camera JR0001 (/dev/video2)
+      - cam_right_wrist: UVC USB Camera JR0002 (/dev/video0)
+    """
     return {
-        "cam_high": OpenCVCameraConfig(
-            camera_index="/dev/video1",
+        "cam_high": IntelRealSenseCameraConfig(
+            serial_number="252443060733",
             fps=30,
             width=640,
             height=480,
         ),
         "cam_left_wrist": OpenCVCameraConfig(
-            camera_index="/dev/video5",
+            camera_index="/dev/video2",
             fps=30,
             width=640,
             height=480,
         ),
         "cam_right_wrist": OpenCVCameraConfig(
-            camera_index="/dev/video3",
+            camera_index="/dev/video0",
             fps=30,
             width=640,
             height=480,

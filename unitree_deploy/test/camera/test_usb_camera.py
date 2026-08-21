@@ -11,21 +11,27 @@ from unitree_deploy.utils.rich_logger import log_success
 
 
 def usb_camera_default_factory():
+    """
+    UVC + Realsense D435i 混合配置:
+      - cam_high: RealSense D435i RGB (serial_number: 252443060733, /dev/video8)
+      - cam_left_wrist: UVC USB Camera JR0001 (/dev/video2)
+      - cam_right_wrist: UVC USB Camera JR0002 (/dev/video0)
+    """
     return {
         "cam_high": OpenCVCameraConfig(
-            camera_index="/dev/video1",
+            camera_index="/dev/video8",  # RealSense D435i RGB stream
             fps=30,
             width=640,
             height=480,
         ),
         "cam_left_wrist": OpenCVCameraConfig(
-            camera_index="/dev/video3",
+            camera_index="/dev/video2",  # JR0001 UVC Camera
             fps=30,
             width=640,
             height=480,
         ),
         "cam_right_wrist": OpenCVCameraConfig(
-            camera_index="/dev/video5",
+            camera_index="/dev/video0",  # JR0002 UVC Camera
             fps=30,
             width=640,
             height=480,
@@ -45,7 +51,7 @@ def run_cameras(camera_style: int = 0):
 
     if camera_style == 0:
         # ========== Single camera ==========
-        camera_kwargs = {"camera_type": "opencv", "camera_index": "/dev/video5", "mock": False}
+        camera_kwargs = {"camera_type": "opencv", "camera_index": "/dev/video0", "mock": False}  # JR0002 UVC Camera
         camera = make_camera(**camera_kwargs)
         camera.connect()
         log_success("Connecting camera.")
