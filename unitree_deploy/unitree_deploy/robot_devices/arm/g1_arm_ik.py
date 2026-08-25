@@ -7,6 +7,10 @@ from pinocchio.visualize import MeshcatVisualizer
 
 from unitree_deploy.utils.weighted_moving_filter import WeightedMovingFilter
 
+# Get absolute path to the package directory for URDF loading
+import os
+_ASSET_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "assets", "g1")
+
 
 class G1_29_ArmIK:
     def __init__(self, unit_test=False, visualization=False):
@@ -15,15 +19,19 @@ class G1_29_ArmIK:
         self.unit_test = unit_test
         self.visualization = visualization
 
+        urdf_path = os.path.join(_ASSET_DIR, "g1_body29_hand14.urdf")
+        if not os.path.exists(urdf_path):
+            raise FileNotFoundError(f"URDF file not found: {urdf_path}")
+
         if not self.unit_test:
             self.robot = pin.RobotWrapper.BuildFromURDF(
-                "unitree_deploy/robot_devices/assets/g1/g1_body29_hand14.urdf",
-                "unitree_deploy/robot_devices/assets/g1/",
+                urdf_path,
+                _ASSET_DIR,
             )
         else:
             self.robot = pin.RobotWrapper.BuildFromURDF(
-                "unitree_deploy/robot_devices/assets/g1/g1_body29_hand14.urdf",
-                "unitree_deploy/robot_devices/assets/g1/",
+                urdf_path,
+                _ASSET_DIR,
             )  # for test
 
         self.mixed_jointsToLockIDs = [
@@ -80,6 +88,9 @@ class G1_29_ArmIK:
                 pin.FrameType.OP_FRAME,
             )
         )
+
+        # Recreate data after adding custom frames so oMf has the right size
+        self.reduced_robot.data = self.reduced_robot.model.createData()
 
         # for i in range(self.reduced_robot.model.nframes):
         #     frame = self.reduced_robot.model.frames[i]
@@ -278,3 +289,151 @@ class G1_29_ArmIK:
         except Exception as e:
             print(f"ERROR in convergence, plotting debug info.{e}")
             return np.zeros(self.reduced_robot.model.nv)
+
+    def solve_fk(self, q: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Compute forward kinematics for left and right end-effectors.
+
+        Args:
+            q: Joint angles for the reduced robot (14D: 7 per arm).
+
+        Returns:
+            (left_ee, right_ee): Each is a dict with keys:
+                'position': np.ndarray of shape (3,) - XYZ position in base frame
+                'rotation': np.ndarray of shape (3,3) - rotation matrix
+        """
+        pin.framesForwardKinematics(self.reduced_robot.model, self.reduced_robot.data, q)
+
+        left_se3 = self.reduced_robot.data.oMf[self.L_hand_id]
+        right_se3 = self.reduced_robot.data.oMf[self.R_hand_id]
+
+        left_ee = {
+            'position': left_se3.translation.copy(),
+            'rotation': left_se3.rotation.copy(),
+        }
+        right_ee = {
+            'position': right_se3.translation.copy(),
+            'rotation': right_se3.rotation.copy(),
+        }
+        return left_ee, right_ee
+
+    def rotation_to_r6(self, rot_matrix: np.ndarray) -> np.ndarray:
+        """
+        Convert a 3x3 rotation matrix to 6D rotation representation.
+        R6 = first two rows of the rotation matrix, flattened.
+
+        Args:
+            rot_matrix: 3x3 rotation matrix
+
+        Returns:
+            np.ndarray of shape (6,)
+        """
+        return rot_matrix[:2, :].flatten()
+
+    def joints_to_ee_proprio_23d(
+        self,
+        arm_q: np.ndarray,
+        gripper_left_q: float = 0.0,
+        gripper_right_q: float = 0.0,
+        waist_rpy: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """
+        Convert robot joint states to the 23D end-effector proprio format
+        expected by the VLA model.
+
+        23D layout:
+            [0-2]   Left EEF XYZ position
+            [3-8]   Left EEF R6 rotation (first two rows of rotation matrix, flattened)
+            [9-11]  Right EEF XYZ position
+            [12-17] Right EEF R6 rotation
+            [18]    Right gripper open/close
+            [19]    Left gripper open/close
+            [20-22] Waist/body RPY (defaults to zeros)
+
+        Args:
+            arm_q: 14D joint angles for both arms (7 per arm).
+            gripper_left_q: Left gripper joint value (scalar).
+            gripper_right_q: Right gripper joint value (scalar).
+            waist_rpy: Optional 3D waist roll-pitch-yaw. Defaults to zeros.
+
+        Returns:
+            np.ndarray of shape (23,) in the VLA proprio format.
+        """
+        left_ee, right_ee = self.solve_fk(arm_q)
+        left_r6 = self.rotation_to_r6(left_ee['rotation'])
+        right_r6 = self.rotation_to_r6(right_ee['rotation'])
+
+        if waist_rpy is None:
+            waist_rpy = np.zeros(3)
+
+        proprio = np.concatenate([
+            left_ee['position'],       # 0-2:  Left XYZ
+            left_r6,                    # 3-8:  Left R6
+            right_ee['position'],      # 9-11: Right XYZ
+            right_r6,                   # 12-17: Right R6
+            np.array([gripper_right_q]),  # 18: Right gripper
+            np.array([gripper_left_q]),   # 19: Left gripper
+            waist_rpy,                  # 20-22: Waist RPY
+        ])
+
+        return proprio
+
+    def ee_proprio_23d_to_arm_ik(
+        self,
+        proprio_23d: np.ndarray,
+        current_arm_q: np.ndarray | None = None,
+        current_arm_dq: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Convert a 23D end-effector proprio/action target back to joint angles via IK.
+
+        Args:
+            proprio_23d: 23D target in VLA format.
+            current_arm_q: Current 14D arm joint angles for IK warm start.
+            current_arm_dq: Current 14D arm joint velocities.
+
+        Returns:
+            (sol_q, sol_tauff): Joint angles and torques.
+        """
+        left_pos = proprio_23d[0:3]
+        left_r6 = proprio_23d[3:9]
+        right_pos = proprio_23d[9:12]
+        right_r6 = proprio_23d[12:18]
+
+        left_rot = self._r6_to_rotation(left_r6)
+        right_rot = self._r6_to_rotation(right_r6)
+
+        left_tf = np.eye(4)
+        left_tf[:3, :3] = left_rot
+        left_tf[:3, 3] = left_pos
+
+        right_tf = np.eye(4)
+        right_tf[:3, :3] = right_rot
+        right_tf[:3, 3] = right_pos
+
+        return self.solve_ik(left_tf, right_tf, current_arm_q, current_arm_dq)
+
+    def _r6_to_rotation(self, r6: np.ndarray) -> np.ndarray:
+        """
+        Convert 6D rotation representation back to a 3x3 rotation matrix.
+        Uses Gram-Schmidt orthogonalization on the first two rows.
+
+        Args:
+            r6: np.ndarray of shape (6,) - flattened first two rows of rotation matrix.
+
+        Returns:
+            np.ndarray of shape (3,3) - orthogonal rotation matrix.
+        """
+        r6_flat = np.asarray(r6).flatten()
+        r1 = r6_flat[:3]
+        r2 = r6_flat[3:6]
+
+        # Gram-Schmidt: make r1 unit, then r2 orthogonal to r1 and unit
+        r1 = r1 / (np.linalg.norm(r1) + 1e-8)
+        r2 = r2 - np.dot(r2, r1) * r1
+        r2 = r2 / (np.linalg.norm(r2) + 1e-8)
+
+        # r3 = r1 x r2
+        r3 = np.cross(r1, r2)
+
+        return np.stack([r1, r2, r3], axis=0)

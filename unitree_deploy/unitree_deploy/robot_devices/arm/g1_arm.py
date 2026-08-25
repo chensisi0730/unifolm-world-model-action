@@ -103,7 +103,17 @@ class G1_29_ArmController:
                 self._subscribe_motor_state, name="g1._subscribe_motor_state"
             )
 
+            # Wait for DDS data with timeout (10 seconds)
+            timeout = 10.0
+            start_time = time.time()
             while not self.lowstate_buffer.get_data():
+                if time.time() - start_time > timeout:
+                    log_warning(
+                        f"⚠️ [G1_29_ArmController] Timeout waiting for DDS data. "
+                        f"Arm may not be connected. Running in fallback mode."
+                    )
+                    # Initialize with default zero state if no data received
+                    break
                 time.sleep(0.01)
                 log_warning("[G1_29_ArmController] Waiting to subscribe dds...")
 
@@ -330,7 +340,8 @@ class G1_29_ArmController:
         return self.g1_arm_ik.solve_tau(current_arm_q, current_arm_dq)
 
     def arm_fk(self, q: np.ndarray | None = None) -> np.ndarray | None:
-        pass
+        """Compute forward kinematics for both arms using the IK solver."""
+        return self.g1_arm_ik.solve_fk(q)
 
     def go_start(self):
         self._drive_to_waypoint(target_pose=self.init_pose, t_insert_time=2.0)
@@ -354,7 +365,23 @@ class G1_29_ArmController:
 
     def disconnect(self):
         self.is_connected = False
-        self.go_home()
+        try:
+            # Stop publish thread first to prevent race conditions
+            if hasattr(self, 'stop_event'):
+                self.stop_event.set()
+            if hasattr(self, 'publish_thread') and self.publish_thread.is_alive():
+                self.publish_thread.join(timeout=2.0)
+            
+            # Try to go home gracefully (may fail during Ctrl+C)
+            try:
+                self._drive_to_waypoint(target_pose=self.init_pose, t_insert_time=1.5)
+                log_success("[G1_29_ArmController] Returned to home position before disconnect")
+            except KeyboardInterrupt:
+                log_warning("[G1_29_ArmController] Interrupted during go_home - skipping graceful return")
+            except Exception as e:
+                log_error(f"[G1_29_ArmController] Error returning home: {e}")
+        except Exception as e:
+            log_error(f"[G1_29_ArmController] Error during disconnect: {e}")
 
     def _is_weak_motor(self, motor_index):
         weak_motors = [

@@ -1,0 +1,139 @@
+diff --git a/cam_config_server.yaml b/cam_config_server.yaml
+index 15c0376..fa05dc1 100644
+--- a/cam_config_server.yaml
++++ b/cam_config_server.yaml
+@@ -1,94 +1,50 @@
+-# =====================================================
+-# Global WebRTC encoder config (applies to ALL cameras).
+-# aiortc bitrate caps are module-level, so this is shared by every track.
+-# Tune by network: WiFi6 5GHz dedicated -> max ~12M; WiFi5 shared -> max ~8M; public -> max ~4M.
+-# =====================================================
+-webrtc:
+-  bitrate:
+-    min: 2000000      # floor under congestion
+-    default: 5000000  # startup rate, skips slow-start
+-    max: 12000000     # quality ceiling on healthy network
+-  gop_length: 60      # frames between keyframes; lower = faster recovery from packet loss
+-
+-# =====================================================
+-# Head camera configuration
+-# =====================================================
+-# camera topic
+ head_camera:
+-  # camera config
+-
+-  # if enable_zmq and enable_webrtc are both false, the camera will not start
+-  # Set to true to enable ZMQ publishing, false to disable
+-  enable_zmq: true
+-  # Port to publish camera stream, e.g. zmq tcp://*:55555.  image_client.py should connect to the same port
+-  zmq_port : 55555
+-  # Set to true to enable WebRTC publishing, false to disable
++  binocular: false
+   enable_webrtc: true
+-  # Port for WebRTC signaling server
+-  webrtc_port : 60001
+-  # webrtc codec preference, options: "vp8", "h264"
+-  webrtc_codec: h264
+-
+-  # Type of camera:
+-  #   - "opencv"    → opencv driver
+-  #   - "realsense" → pyrealsense2 driver
+-  #   - "uvc"       → pyuvc driver
+-  type: uvc
+-
+-  # Image Format
+-  # image resolution: [height, width]
+-  image_shape: [480, 1280]
+-  binocular: true
+-  # frame per second
++  enable_zmq: true
+   fps: 30
+-
+-  # Camera identifiers (choose one or more):
+-  #   - video_id: X        → /dev/videoX  (e.g. 0 → /dev/video0)
+-  #   - serial_number: Y   → camera's hardware serial (e.g. 141722079879)
+-  #   - physical_path: Z   → sysfs physical USB path (e.g. /sys/devices/pci0000:00/.../1-11.2:1.0)
+-  #
+-  # Identifier priority:
+-  #   physical_path > serial_number > video_id
+-  #   if an identifier is not used, set it to null. The system will resolve the camera by priority.
+-  #
+-  # Notes:
+-  #   - type "realsense": supports serial_number only (but a RealSense can also be used as opencv/uvc if desired)
+-  #   - type "opencv":    supports video_id, serial_number, physical_path
+-  #   - type "uvc":       supports video_id, serial_number, physical_path
+-  video_id: 0
+-  serial_number: 01.00.00
++  image_shape:
++  - 720
++  - 1280
+   physical_path: null
+-
+-# =====================================================
+-# Left wrist camera configuration
+-# =====================================================
+-left_wrist_camera:
+-  enable_zmq: true
+-  zmq_port : 55556
+-  enable_webrtc: true
+-  webrtc_port : 60002
++  serial_number: '348522076577'
++  type: realsense
++  video_id: null
+   webrtc_codec: h264
+-  type: uvc
+-  image_shape: [480, 640]
++  webrtc_port: 60001
++  zmq_port: 55555
++left_wrist_camera:
+   binocular: false
++  enable_webrtc: true
++  enable_zmq: true
+   fps: 30
+-  video_id: 2
+-  serial_number: 200901010001
++  image_shape:
++  - 720
++  - 1280
+   physical_path: null
+-
+-# =====================================================
+-# Right wrist camera configuration
+-# =====================================================
+-right_wrist_camera:
+-  enable_zmq: true
+-  zmq_port : 55557
+-  enable_webrtc: true
+-  webrtc_port: 60003
+-  webrtc_codec: h264
++  serial_number: JR0001
+   type: uvc
+-  image_shape: [480, 640]
++  video_id: 2
++  webrtc_codec: h264
++  webrtc_port: 60002
++  zmq_port: 55556
++right_wrist_camera:
+   binocular: false
++  enable_webrtc: false
++  enable_zmq: false
+   fps: 30
+-  video_id: 4
+-  serial_number: 200901010002
+-  physical_path: null
+\ No newline at end of file
++  image_shape:
++  - 480
++  - 640
++  physical_path: null
++  serial_number: null
++  type: uvc
++  video_id: null
++  webrtc_port: null
++  zmq_port: null
++webrtc:
++  bitrate:
++    default: 5000000
++    max: 12000000
++    min: 2000000
++  gop_length: 60

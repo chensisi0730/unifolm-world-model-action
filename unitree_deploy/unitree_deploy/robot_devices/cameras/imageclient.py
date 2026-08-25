@@ -28,7 +28,7 @@ class ImageClient:
         wrist_img_shape=None,
         wrist_img_shm_name=None,
         image_show=False,
-        server_address="192.168.123.164",
+        server_address="192.168.0.109",  # G1机器人IP地址
         port=5555,
         unit_test=False,
     ):
@@ -296,15 +296,25 @@ class ImageClientCamera:
 
     def disconnect(self):
         if not self.is_connected:
-            raise RobotDeviceNotConnectedError(
-                f"ImageClient({self.camera_index}) is not connected. Try running `camera.connect()` first."
-            )
+            return
 
-        self.tv_img_shm.unlink()
-        self.tv_img_shm.close()
-        if self.has_wrist_camera:
-            self.wrist_img_shm.unlink()
-            self.wrist_img_shm.close()
+        try:
+            self.tv_img_shm.unlink()
+        except FileNotFoundError:
+            pass
+        try:
+            self.tv_img_shm.close()
+        except FileNotFoundError:
+            pass
+        if self.has_wrist_camera and self.wrist_img_shm is not None:
+            try:
+                self.wrist_img_shm.unlink()
+            except FileNotFoundError:
+                pass
+            try:
+                self.wrist_img_shm.close()
+            except FileNotFoundError:
+                pass
         self.is_connected = False
 
     def __del__(self):

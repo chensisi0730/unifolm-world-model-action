@@ -110,15 +110,27 @@ def z1_dual_intelrealsense_camera_default_factory():
     }
 
 
+def g1_intelrealsense_camera_default_factory():
+    """G1 with Intel RealSense D435i camera on head"""
+    return {
+        "cam_right_high": IntelRealSenseCameraConfig(
+            serial_number="348522076577",  # G1头部D435i序列号
+            fps=30,
+            width=640,
+            height=480,
+        ),
+    }
+
+
 def g1_image_client_default_factory():
     return {
         "imageclient": ImageClientCameraConfig(
             head_camera_type="opencv",
             head_camera_id_numbers=[4],
-            head_camera_image_shape=[480, 1280],  # Head camera resolution
-            wrist_camera_type="opencv",
-            wrist_camera_id_numbers=[0, 2],
-            wrist_camera_image_shape=[480, 640],  # Wrist camera resolution
+            head_camera_image_shape=[480, 640],  # Head camera resolution
+            wrist_camera_type=None,
+            wrist_camera_id_numbers=None,
+            wrist_camera_image_shape=None,
             aspect_ratio_threshold=2.0,
             fps=30,
             mock=False,
@@ -164,7 +176,7 @@ def usb_camera_default_factory():
 def dex1_default_factory():
     return {
         "left": Dex1_GripperConfig(
-            unit_test=True,
+            unit_test=False,
             motors={
                 "kLeftGripper": [0, "z1_gripper-joint"],
             },
@@ -172,7 +184,7 @@ def dex1_default_factory():
             topic_gripper_command="rt/dex1/left/cmd",
         ),
         "right": Dex1_GripperConfig(
-            unit_test=True,
+            unit_test=False,
             motors={
                 "kRightGripper": [1, "z1_gripper-joint"],
             },
@@ -274,3 +286,12 @@ class G1_Dex1_Imageclint_RobotConfig(UnitreeRobotConfig):
     cameras: dict[str, CameraConfig] = field(default_factory=g1_image_client_default_factory)
     arm: dict[str, ArmConfig] = field(default_factory=g1_dual_arm_default_factory)
     endeffector: dict[str, EndEffectorConfig] = field(default_factory=dex1_default_factory)
+
+
+# =============================== Arm:g1, Camera:intelrealsense (D435i) ========================================
+@RobotConfig.register_subclass("g1_realsense")
+@dataclass
+class G1_Realsense_RobotConfig(UnitreeRobotConfig):
+    """G1 with Intel RealSense D435i camera on head (no gripper, direct arm control)"""
+    cameras: dict[str, CameraConfig] = field(default_factory=g1_intelrealsense_camera_default_factory)
+    arm: dict[str, ArmConfig] = field(default_factory=g1_dual_arm_default_factory)

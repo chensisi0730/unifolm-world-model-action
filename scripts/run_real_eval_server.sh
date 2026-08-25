@@ -1,8 +1,8 @@
-model_name=testing
-ckpt=/path/to/model/checkpoint
+model_name=UnifoLM-WMA-0_G1
+ckpt=/path/to/model/checkpoint  # TODO: 替换为实际模型checkpoint路径，如 /home/css/models/UnifoLM-WMA-0-Dual.ckpt
 config=configs/inference/world_model_decision_making.yaml
 seed=123
-res_dir="path/to/results/directory"
+res_dir="/home/css/work/vla_results"
 datasets=(
     "unitree_g1_pack_camera"
 )
@@ -14,7 +14,7 @@ for dataset in "${datasets[@]}"; do
     --ckpt_path $ckpt \
     --config $config \
     --savedir "${res_dir}/${dataset}/${model_name}/videos" \
-    --bs 1 --height 320 --width 512 \
+    --bs 1 --height 480 --width 640 \
     --unconditional_guidance_scale 1.0 \
     --ddim_steps 16 \
     --ddim_eta 1.0 \

@@ -91,7 +91,23 @@ class Dex1_Gripper_Controller:
             self.subscribe_state_thread.daemon = True
             self.subscribe_state_thread.start()
 
+            # Wait for DDS data with timeout (5 seconds)
+            timeout = 5.0
+            start_time = time.time()
             while not self.lowstate_buffer.get_data():
+                if time.time() - start_time > timeout:
+                    log_warning(
+                        f"⚠️ [Dex1_Gripper_Controller] Timeout waiting for DDS data on '{self.topic_gripper_state}'. "
+                        f"Gripper may not be connected. Running in fallback mode."
+                    )
+                    # Initialize with default zero state if no data received
+                    lowstate = Gripper_LowState()
+                    for idx, _ in enumerate(Gripper_Sigle_JointIndex):
+                        lowstate.motor_state[idx].q = 0.0
+                        lowstate.motor_state[idx].dq = 0.0
+                    self.lowstate_buffer.set_data(lowstate)
+                    break
+
                 time.sleep(0.01)
                 log_warning("[Dex1_Gripper_Controller] Waiting to subscribe dds...")
 

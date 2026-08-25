@@ -1,3 +1,4 @@
+import json
 import logging
 import sys
 import time
@@ -18,54 +19,163 @@ from datasets import load_from_disk
 from datasets.features.features import register_feature
 from safetensors.torch import load_file
 
+import json_numpy
+
 logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
 
 
+class NumpyEncoder(json.JSONEncoder):
+    """Custom JSON encoder that handles numpy arrays."""
+    def default(self, obj):
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, (np.integer,)):
+            return int(obj)
+        if isinstance(obj, (np.floating,)):
+            return float(obj)
+        if isinstance(obj, np.bool_):
+            return bool(obj)
+        return super().default(obj)
+
+
 class LongConnectionClient:
-    def __init__(self, base_url):
+    def __init__(self, base_url, max_retries=3):
         self.session = requests.Session()
         self.base_url = base_url
+        self.max_retries = max_retries
 
-    def send_post(self, endpoint, json_data):
-        """send POST request to  endpoint"""
+    def send_post(self, endpoint, json_data, timeout=30.0):
+        """send POST request to VLA server with retry logic"""
         url = f"{self.base_url}{endpoint}"
-        response = None
-        while True:
+        
+        for attempt in range(1, self.max_retries + 1):
             try:
-                response = self.session.post(url, json=json_data)
+                logging.info(f"Sending request to {url} (attempt {attempt}/{self.max_retries})")
+                # Use json_numpy to properly serialize numpy arrays
+                payload = json_numpy.dumps(json_data)
+                response = self.session.post(url, data=payload, 
+                                            headers={"Content-Type": "application/json"},
+                                            timeout=timeout)
+                
                 if response.status_code == 200:
                     data = response.json()
-                    if data["result"] == "ok":
-                        response = data
-                        break
-                    else:
-                        logging.info(data["desc"])
-
-                time.sleep(1)
+                    # Check if it's an error string
+                    if isinstance(data, str) and data == "error":
+                        logging.error(f"VLA server returned 'error' - check request format. Payload size: {len(payload)} bytes")
+                        continue  # retry on next iteration
+                    # Server may return json_numpy-encoded string in double-encode mode
+                    if isinstance(data, str):
+                        data = json_numpy.loads(data)
+                    
+                    return data
+                    
+                # Non-200 status code - log and retry
+                logging.warning(f"HTTP {response.status_code}: {response.text[:200]}")
+                        
+            except requests.exceptions.ConnectionError as e:
+                logging.error(f"[Attempt {attempt}/{self.max_retries}] Connection failed to {url}: {e}")
+            except requests.exceptions.Timeout as e:
+                logging.error(f"[Attempt {attempt}/{self.max_retries}] Request timed out: {e}")
             except Exception as e:
-                logging.error(f"An error occurred: {e}")
-                logging.error(traceback.format_exc())
-
-        return response
+                logging.error(f"[Attempt {attempt}/{self.max_retries}] An error occurred: {e}")
+            
+            # Wait before retry (don't wait on last attempt)
+            if attempt < self.max_retries:
+                wait_time = 2 ** (attempt - 1)  # exponential backoff: 1s, 2s...
+                logging.info(f"Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+        
+        raise ConnectionError(
+            f"Failed to connect to VLA server at {url} after {self.max_retries} attempts. "
+            f"Please check if the server is running and reachable."
+        )
 
     def close(self):
-        """ "close session"""
+        """close session"""
         self.session.close()
 
-    def predict_action(self, language_instruction, batch) -> torch.Tensor:
-        # collect data
-        data = {
-            "language_instruction": language_instruction,
-            "observation.state": torch.stack(list(batch["observation.state"])).tolist(),
-            "observation.images.top": torch.stack(list(batch["observation.images.top"])).tolist(),
-            "action": torch.stack(list(batch["action"])).tolist(),
+    def predict_action(self, language_instruction, batch, arm_ik=None,
+                       gripper_left_q=0.0, gripper_right_q=0.0) -> torch.Tensor:
+        """
+        Send observation to VLA server and get predicted action.
+        
+        VLA server expects format per unifolm-vla API (double-encoded):
+        {
+            "encoded": "{\"observations\": [{\"full_image\": numpy_array, \"state\": numpy_array, \"instruction\": str}]}"
         }
-
-        # send data
-        endpoint = "/predict_action"
+        
+        Server returns action array of shape (25 timesteps, 23 dims) for G1 tasks.
+        We return the first timestep's action as the prediction to execute.
+        
+        Args:
+            language_instruction: Task description string.
+            batch: Observation dict with queues.
+            arm_ik: G1_29_ArmIK instance for computing FK to convert 14D joints -> 23D proprio.
+            gripper_left_q: Current left gripper joint value.
+            gripper_right_q: Current right gripper joint value.
+        """
+        # Extract the latest observation from batch queues
+        state = list(batch["observation.state"])[-1]  # most recent frame
+        image = list(batch["observation.images.top"])[-1]  # most recent image
+        
+        # Convert tensors to numpy for JSON serialization
+        # Image: (C, H, W) -> (H, W, C), values in [0, 255] uint8
+        if image.dim() == 3:
+            img_np = image.permute(1, 2, 0).cpu().numpy()
+            # Ensure uint8 format for VLA server
+            if img_np.dtype != np.uint8:
+                if img_np.min() < 0 or img_np.max() <= 1.0:
+                    img_np = (img_np * 255).astype(np.uint8)
+                else:
+                    img_np = img_np.astype(np.uint8)
+        
+        # State: proprioception - convert joint angles to 23D EE proprio via FK
+        state_np = state.cpu().numpy().astype(np.float64)
+        
+        if arm_ik is not None and len(state_np) in (14, 16):
+            # Extract arm joints (first 14D) and gripper values (if 16D)
+            arm_q = state_np[:14]
+            gripper_l = float(state_np[14]) if len(state_np) > 14 else gripper_left_q
+            gripper_r = float(state_np[15]) if len(state_np) > 15 else gripper_right_q
+            state_23d = arm_ik.joints_to_ee_proprio_23d(
+                arm_q=arm_q,
+                gripper_left_q=gripper_l,
+                gripper_right_q=gripper_r,
+            )
+        else:
+            state_23d = state_np
+        
+        logging.debug(f"Image: dtype={img_np.dtype}, shape={img_np.shape}, range=[{img_np.min()}, {img_np.max()}]")
+        logging.debug(f"State: shape={state_23d.shape}, values={[round(float(x),3) for x in state_23d[:6]]}...")
+        
+        # Build VLA server request format with raw numpy arrays
+        observations = [{
+            "full_image": img_np,       # HxWx3 numpy array
+            "state": state_23d,         # 23D proprioception numpy array
+            "instruction": language_instruction,
+        }]
+        
+        inner_payload = {"observations": observations}
+        
+        # Use double-encode: serialize inner payload with json_numpy to preserve numpy arrays,
+        # then wrap in "encoded" field so server's json.loads can reconstruct them properly
+        encoded_str = json_numpy.dumps(inner_payload)
+        data = {"encoded": encoded_str}
+        
+        endpoint = "/act"
         response = self.send_post(endpoint, data)
-        # action = torch.tensor(response['action']).unsqueeze(0)
-        action = torch.tensor(response["action"])
+        
+        # VLA server returns action array of shape (25 timesteps, 23 dims) for G1 tasks
+        # Response may already be numpy array (from json_numpy) or nested list
+        action_np = np.array(response, dtype=np.float32)
+        logging.debug(f"VLA returned action shape: {action_np.shape}")
+        
+        # Return the first timestep's action as prediction to execute now
+        if action_np.ndim == 2 and action_np.shape[0] > 1:
+            action = torch.tensor(action_np[0]).float()  # First step only
+        else:
+            action = torch.tensor(action_np).float()
+        
         return action
 
 
