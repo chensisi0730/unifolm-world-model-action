@@ -61,8 +61,13 @@ def prepare_observation(args: argparse.Namespace, obs: Any) -> OrderedDict:
         torch.from_numpy(rgb_image).permute(2, 0, 1),
         "observation.state":
         torch.from_numpy(obs.observation["qpos"]),
-        "action": ZERO_ACTION[args.robot_type],
     }
+    if "cam_left_wrist" in obs.observation["images"]:
+        left_wrist = cv2.cvtColor(obs.observation["images"]["cam_left_wrist"], cv2.COLOR_BGR2RGB)
+        observation["observation.images.left_wrist"] = torch.from_numpy(left_wrist).permute(2, 0, 1)
+    if "cam_right_wrist" in obs.observation["images"]:
+        right_wrist = cv2.cvtColor(obs.observation["images"]["cam_right_wrist"], cv2.COLOR_BGR2RGB)
+        observation["observation.images.right_wrist"] = torch.from_numpy(right_wrist).permute(2, 0, 1)
     return OrderedDict(observation)
 
 
@@ -99,64 +104,90 @@ def run_policy(
         gripper_left_q = float(current_state[14]) if len(current_state) > 14 else 0.0
         gripper_right_q = float(current_state[15]) if len(current_state) > 15 else 0.0
 
-        # Call VLA server for action prediction (returns single 23D action)
-        pred_action_23d = client.predict_action(
+        # Call VLA server for an action chunk.
+        pred_actions_23d = client.predict_action(
             args.language_instruction, cond_obs_queues,
             arm_ik=arm_ik,
             gripper_left_q=gripper_left_q,
             gripper_right_q=gripper_right_q,
         )
         
-        # Map VLA 23D output -> robot 16D joint space action
-        action_23d_np = pred_action_23d.cpu().numpy()
-        
-        if arm_ik is not None and len(action_23d_np) == 23:
-            # Use IK to convert 23D end-effector target to 14D arm joint angles
-            # Warm-start IK from actual current robot state for better convergence
-            current_arm_q = obs["observation.state"][:14].cpu().numpy().astype(np.float64)
-            sol_q, _ = arm_ik.ee_proprio_23d_to_arm_ik(
-                action_23d_np, current_arm_q=current_arm_q)
-            
-            # Build 16D action: 14D arm joints + 2D gripper
+        # Map VLA 23D output chunk -> robot 16D joint-space action chunk.
+        actions_23d_np = pred_actions_23d.cpu().numpy()
+        if actions_23d_np.ndim == 1:
+            actions_23d_np = actions_23d_np[None, :]
+
+        robot_actions = []
+        current_arm_q = obs["observation.state"][:14].cpu().numpy().astype(np.float64)
+        initial_arm_q = current_arm_q.copy()
+        current_proprio_23d = None
+        if arm_ik is not None:
+            current_proprio_23d = arm_ik.joints_to_ee_proprio_23d(
+                current_arm_q,
+                gripper_left_q=gripper_left_q,
+                gripper_right_q=gripper_right_q,
+            )
+        for idx, action_23d_np in enumerate(actions_23d_np[:args.action_horizon]):
             env_action_dim = len(INIT_POSE[args.robot_type])  # 16
-            base_action = np.zeros(env_action_dim, dtype=np.float32)
-            base_action[:14] = sol_q[:14]           # arm joints from IK
-            base_action[14] = action_23d_np[19]     # Left gripper (dim 19 in 23D)
-            base_action[15] = action_23d_np[18]     # Right gripper (dim 18 in 23D)
-            
-            if t % 10 == 0:
-                logging.info(f"  IK in: {[f'{x:.3f}' for x in current_arm_q[:4]]}... "
-                           f"out: {[f'{x:.3f}' for x in sol_q[:4]]}... "
-                           f"diff: {[f'{x:.4f}' for x in (sol_q - current_arm_q)[:4]]}")
-        else:
-            # Fallback: use INIT_POSE for arms, only update grippers
-            env_action_dim = len(INIT_POSE[args.robot_type])  # 16
-            base_action = np.array(INIT_POSE[args.robot_type])[:env_action_dim]
-            if len(action_23d_np) >= 20:
-                base_action[14] = action_23d_np[19]  # Left gripper
-                base_action[15] = action_23d_np[18]  # Right gripper
-        
-        pred_actions = torch.from_numpy(base_action).unsqueeze(0)  # shape: (1, 16)
-        
-        logging.debug(f"VLA returned {pred_action_23d.shape}D -> mapped to robot action {pred_actions.shape}")
+            if arm_ik is not None and len(action_23d_np) == 23:
+                sol_q, _ = arm_ik.ee_proprio_23d_to_arm_ik(
+                    action_23d_np, current_arm_q=current_arm_q)
 
-        # VLA returns single-step actions, so execute directly without temporal ensembling
-        action = pred_actions[0].cpu().numpy()  # shape: (16,)
-        
-        logging.info(f"Executing action step {t}: gripper_L={action[14]:.3f}, gripper_R={action[15]:.3f}")
+                base_action = np.zeros(env_action_dim, dtype=np.float32)
+                base_action[:14] = sol_q[:14]
+                base_action[14] = action_23d_np[19]
+                base_action[15] = action_23d_np[18]
+                current_arm_q = sol_q[:14].astype(np.float64)
 
-        # Execute the single action step immediately
-        print(f">>> Exec => step {t} action: gripper_L={action[14]:.3f}, R={action[15]:.3f}", flush=True)
-        
-        # Maintain real-time loop at control_freq Hz
-        t1 = time.time()
-        obs = env.step(action)
-        time.sleep(max(0, 1 / args.control_freq - time.time() + t1))
-        t += 1
+                if idx == 0:
+                    q_diff = sol_q[:14] - initial_arm_q
+                    logging.info(f"  IK in: {[f'{x:.3f}' for x in initial_arm_q[:4]]}... "
+                                 f"out: {[f'{x:.3f}' for x in sol_q[:4]]}...")
+                    if current_proprio_23d is not None:
+                        left_delta = action_23d_np[0:3] - current_proprio_23d[0:3]
+                        right_delta = action_23d_np[9:12] - current_proprio_23d[9:12]
+                        logging.info(
+                            "  VLA EE target: "
+                            f"L_xyz={[f'{x:.3f}' for x in action_23d_np[0:3]]}, "
+                            f"R_xyz={[f'{x:.3f}' for x in action_23d_np[9:12]]}, "
+                            f"dL={[f'{x:.3f}' for x in left_delta]}, "
+                            f"dR={[f'{x:.3f}' for x in right_delta]}, "
+                            f"body={[f'{x:.3f}' for x in action_23d_np[20:23]]}"
+                        )
+                    logging.info(
+                        "  IK joint delta: "
+                        f"norm={np.linalg.norm(q_diff):.4f}, "
+                        f"max_abs={np.max(np.abs(q_diff)):.4f}, "
+                        f"first4={[f'{x:.4f}' for x in q_diff[:4]]}"
+                    )
+            else:
+                base_action = np.array(INIT_POSE[args.robot_type])[:env_action_dim]
+                if len(action_23d_np) >= 20:
+                    base_action[14] = action_23d_np[19]
+                    base_action[15] = action_23d_np[18]
+            robot_actions.append(base_action)
 
-        # Update queues for next prediction cycle
-        obs = prepare_observation(args, obs)
-        cond_obs_queues = populate_queues(cond_obs_queues, obs)
+        pred_actions = torch.from_numpy(np.stack(robot_actions, axis=0)).unsqueeze(0)
+        logging.debug(f"VLA returned {pred_actions_23d.shape} -> mapped to robot actions {pred_actions.shape}")
+
+        actions = temporal_ensembler.update(pred_actions[:, :args.action_horizon])[0]
+
+        for n in range(min(args.exe_steps - t, actions.shape[0])):
+            action = actions[n].cpu().numpy()
+            logging.info(f"Executing action step {t}: gripper_L={action[14]:.3f}, gripper_R={action[15]:.3f}")
+            print(f">>> Exec => step {t} action: gripper_L={action[14]:.3f}, R={action[15]:.3f}", flush=True)
+
+            t1 = time.time()
+            obs = env.step(action)
+            time.sleep(max(0, 1 / args.control_freq - time.time() + t1))
+            t += 1
+
+            obs_for_queue = prepare_observation(args, obs)
+            cond_obs_queues = populate_queues(cond_obs_queues, obs_for_queue)
+            cond_obs_queues = populate_queues(
+                cond_obs_queues,
+                {"action": torch.from_numpy(action.astype(np.float32))},
+            )
 
 
 def run_eval(args: argparse.Namespace) -> None:
@@ -165,19 +196,18 @@ def run_eval(args: argparse.Namespace) -> None:
     logging.info(f"Connecting to VLA server at {vla_url}")
     client = LongConnectionClient(vla_url, max_retries=3)
 
-    # Initialize ACT temporal moving-averge smoother
-    temporal_ensembler = ACTTemporalEnsembler(temporal_ensemble_coeff=0.01,
-                                              chunk_size=args.action_horizon,
-                                              exe_steps=args.exe_steps)
-    temporal_ensembler.reset()
-
-    # Initialize observation and action horizon queue
-    cond_obs_queues = {
-        "observation.images.top": deque(maxlen=args.observation_horizon),
-        "observation.state": deque(maxlen=args.observation_horizon),
-        "action": deque(
-            maxlen=16),  # NOTE: HAND CODE AS THE MODEL PREDCIT FUTURE 16 STEPS
-    }
+    def make_cond_obs_queues():
+        cond_obs_queues = {
+            "observation.images.top": deque(maxlen=args.observation_horizon),
+            "observation.images.left_wrist": deque(maxlen=args.observation_horizon),
+            "observation.images.right_wrist": deque(maxlen=args.observation_horizon),
+            "observation.state": deque(maxlen=args.observation_horizon),
+            "action": deque(maxlen=args.action_horizon),
+        }
+        return populate_queues(
+            cond_obs_queues,
+            {"action": ZERO_ACTION[args.robot_type]},
+        )
 
     # Initialize FK/IK solver for G1 arm (converts between joint angles and EE poses)
     arm_ik = None
@@ -193,6 +223,10 @@ def run_eval(args: argparse.Namespace) -> None:
 
     try:
         for episode_idx in tqdm.tqdm(range(0, args.num_rollouts_planned)):
+            temporal_ensembler = ACTTemporalEnsembler(temporal_ensemble_coeff=0.01,
+                                                      chunk_size=args.action_horizon,
+                                                      exe_steps=args.exe_steps)
+            cond_obs_queues = make_cond_obs_queues()
             output_dir = Path(args.output_dir) / f"episode_{episode_idx:03d}"
             output_dir.mkdir(parents=True, exist_ok=True)
             run_policy(args, env, client, temporal_ensembler, cond_obs_queues,

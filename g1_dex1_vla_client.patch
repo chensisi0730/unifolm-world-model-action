@@ -1,3 +1,1061 @@
+diff --git a/g1_dex1_vla_client.patch b/g1_dex1_vla_client.patch
+new file mode 100644
+index 0000000..f955636
+--- /dev/null
++++ b/g1_dex1_vla_client.patch
+@@ -0,0 +1,865 @@
++diff --git a/scripts/run_real_eval_server.sh b/scripts/run_real_eval_server.sh
++index f3c1947..0c44bf0 100644
++--- a/scripts/run_real_eval_server.sh
+++++ b/scripts/run_real_eval_server.sh
++@@ -1,8 +1,8 @@
++-model_name=testing
++-ckpt=/path/to/model/checkpoint
+++model_name=UnifoLM-WMA-0_G1
+++ckpt=/path/to/model/checkpoint  # TODO: 替换为实际模型checkpoint路径，如 /home/css/models/UnifoLM-WMA-0-Dual.ckpt
++ config=configs/inference/world_model_decision_making.yaml
++ seed=123
++-res_dir="path/to/results/directory"
+++res_dir="/home/css/work/vla_results"
++ datasets=(
++     "unitree_g1_pack_camera"
++ )
++@@ -14,7 +14,7 @@ for dataset in "${datasets[@]}"; do
++     --ckpt_path $ckpt \
++     --config $config \
++     --savedir "${res_dir}/${dataset}/${model_name}/videos" \
++-    --bs 1 --height 320 --width 512 \
+++    --bs 1 --height 480 --width 640 \
++     --unconditional_guidance_scale 1.0 \
++     --ddim_steps 16 \
++     --ddim_eta 1.0 \
++diff --git a/unitree_deploy/scripts/robot_client.py b/unitree_deploy/scripts/robot_client.py
++index da98126..6e5ec51 100644
++--- a/unitree_deploy/scripts/robot_client.py
+++++ b/unitree_deploy/scripts/robot_client.py
++@@ -1,4 +1,5 @@
++ import argparse
+++import logging
++ import os
++ import time
++ import cv2
++@@ -16,29 +17,33 @@ from unitree_deploy.utils.eval_utils import (
++     LongConnectionClient,
++     populate_queues,
++ )
+++from unitree_deploy.robot_devices.arm.g1_arm_ik import G1_29_ArmIK
++ 
++ # -----------------------------------------------------------------------------
++ # Network & environment defaults
++ # -----------------------------------------------------------------------------
++ os.environ["http_proxy"] = ""
++ os.environ["https_proxy"] = ""
++-HOST = "127.0.0.1"
++-PORT = 8000
+++HOST = "192.168.0.102"
+++PORT = 8778
++ BASE_URL = f"http://{HOST}:{PORT}"
++ 
++ # fmt: off
++ INIT_POSE = {
++     'g1_dex1': np.array([0.10559805, 0.02726714, -0.01210221, -0.33341318, -0.22513399, -0.02627627, -0.15437093,  0.1273793 , -0.1674708 , -0.11544029, -0.40095493,  0.44332668,  0.11566751,  0.3936641, 5.4, 5.4], dtype=np.float32),
+++    'g1_realsense': np.array([0.10559805, 0.02726714, -0.01210221, -0.33341318, -0.22513399, -0.02627627, -0.15437093,  0.1273793 , -0.1674708 , -0.11544029, -0.40095493,  0.44332668,  0.11566751,  0.3936641, 5.4, 5.4], dtype=np.float32),
++     'z1_dual_dex1_realsense': np.array([-1.0262332,  1.4281361, -1.2149128,  0.6473399, -0.12425245, 0.44945636,  0.89584476,  1.2593982, -1.0737865,  0.6672816, 0.39730102, -0.47400007, 0.9894176, 0.9817477 ], dtype=np.float32),
++     'z1_realsense': np.array([-0.06940782, 1.4751548, -0.7554075, 1.0501366, 0.02931615, -0.02810347, -0.99238837], dtype=np.float32),
++ }
++ ZERO_ACTION = {
++     'g1_dex1': torch.zeros(16, dtype=torch.float32),
+++    'g1_realsense': torch.zeros(16, dtype=torch.float32),
++     'z1_dual_dex1_realsense': torch.zeros(14, dtype=torch.float32),
++     'z1_realsense': torch.zeros(7, dtype=torch.float32),
++ }
++ CAM_KEY = {
++-    'g1_dex1': 'cam_right_high',
+++    'g1_dex1': 'cam_high',
+++    'g1_realsense': 'cam_high',
++     'z1_dual_dex1_realsense': 'cam_high',
++     'z1_realsense': 'cam_high',
++ }
++@@ -68,6 +73,7 @@ def run_policy(
++     temporal_ensembler: ACTTemporalEnsembler,
++     cond_obs_queues: MutableMapping[str, Deque[torch.Tensor]],
++     output_dir: Path,
+++    arm_ik: Any = None,
++ ) -> None:
++     """
++     Single rollout loop:
++@@ -81,39 +87,83 @@ def run_policy(
++     time.sleep(2.0)
++     t = 0
++ 
++-    while True:
++-        # Gapture observation
+++    while t < args.exe_steps:
+++        # Capture observation
++         obs = env.get_observation(t)
++         # Format observation
++         obs = prepare_observation(args, obs)
++         cond_obs_queues = populate_queues(cond_obs_queues, obs)
++-        # Call server to get actions
++-        pred_actions = client.predict_action(args.language_instruction,
++-                                             cond_obs_queues).unsqueeze(0)
++-        # Keep only the next horizon of actions and apply temporal ensemble smoothing
++-        actions = temporal_ensembler.update(
++-            pred_actions[:, :args.action_horizon])[0]
++-
++-        # Execute the actions
++-        for n in range(args.exe_steps):
++-            action = actions[n].cpu().numpy()
++-            print(f">>> Exec => step {n} action: {action}", flush=True)
++-            print("---------------------------------------------")
++-
++-            # Maintain real-time loop at `control_freq` Hz
++-            t1 = time.time()
++-            obs = env.step(action)
++-            time.sleep(max(0, 1 / args.control_freq - time.time() + t1))
++-            t += 1
++-
++-            # Prime the queue for the next action step (except after the last one in this chunk)
++-            if n < args.exe_steps - 1:
++-                obs = prepare_observation(args, obs)
++-                cond_obs_queues = populate_queues(cond_obs_queues, obs)
+++
+++        # Get current gripper values from the robot state (last 2 dims of 16D state)
+++        current_state = obs["observation.state"]
+++        gripper_left_q = float(current_state[14]) if len(current_state) > 14 else 0.0
+++        gripper_right_q = float(current_state[15]) if len(current_state) > 15 else 0.0
+++
+++        # Call VLA server for action prediction (returns single 23D action)
+++        pred_action_23d = client.predict_action(
+++            args.language_instruction, cond_obs_queues,
+++            arm_ik=arm_ik,
+++            gripper_left_q=gripper_left_q,
+++            gripper_right_q=gripper_right_q,
+++        )
+++        
+++        # Map VLA 23D output -> robot 16D joint space action
+++        action_23d_np = pred_action_23d.cpu().numpy()
+++        
+++        if arm_ik is not None and len(action_23d_np) == 23:
+++            # Use IK to convert 23D end-effector target to 14D arm joint angles
+++            # Warm-start IK from actual current robot state for better convergence
+++            current_arm_q = obs["observation.state"][:14].cpu().numpy().astype(np.float64)
+++            sol_q, _ = arm_ik.ee_proprio_23d_to_arm_ik(
+++                action_23d_np, current_arm_q=current_arm_q)
+++            
+++            # Build 16D action: 14D arm joints + 2D gripper
+++            env_action_dim = len(INIT_POSE[args.robot_type])  # 16
+++            base_action = np.zeros(env_action_dim, dtype=np.float32)
+++            base_action[:14] = sol_q[:14]           # arm joints from IK
+++            base_action[14] = action_23d_np[19]     # Left gripper (dim 19 in 23D)
+++            base_action[15] = action_23d_np[18]     # Right gripper (dim 18 in 23D)
+++            
+++            if t % 10 == 0:
+++                logging.info(f"  IK in: {[f'{x:.3f}' for x in current_arm_q[:4]]}... "
+++                           f"out: {[f'{x:.3f}' for x in sol_q[:4]]}... "
+++                           f"diff: {[f'{x:.4f}' for x in (sol_q - current_arm_q)[:4]]}")
+++        else:
+++            # Fallback: use INIT_POSE for arms, only update grippers
+++            env_action_dim = len(INIT_POSE[args.robot_type])  # 16
+++            base_action = np.array(INIT_POSE[args.robot_type])[:env_action_dim]
+++            if len(action_23d_np) >= 20:
+++                base_action[14] = action_23d_np[19]  # Left gripper
+++                base_action[15] = action_23d_np[18]  # Right gripper
+++        
+++        pred_actions = torch.from_numpy(base_action).unsqueeze(0)  # shape: (1, 16)
+++        
+++        logging.debug(f"VLA returned {pred_action_23d.shape}D -> mapped to robot action {pred_actions.shape}")
+++
+++        # VLA returns single-step actions, so execute directly without temporal ensembling
+++        action = pred_actions[0].cpu().numpy()  # shape: (16,)
+++        
+++        logging.info(f"Executing action step {t}: gripper_L={action[14]:.3f}, gripper_R={action[15]:.3f}")
+++
+++        # Execute the single action step immediately
+++        print(f">>> Exec => step {t} action: gripper_L={action[14]:.3f}, R={action[15]:.3f}", flush=True)
+++        
+++        # Maintain real-time loop at control_freq Hz
+++        t1 = time.time()
+++        obs = env.step(action)
+++        time.sleep(max(0, 1 / args.control_freq - time.time() + t1))
+++        t += 1
+++
+++        # Update queues for next prediction cycle
+++        obs = prepare_observation(args, obs)
+++        cond_obs_queues = populate_queues(cond_obs_queues, obs)
++ 
++ 
++ def run_eval(args: argparse.Namespace) -> None:
++-    client = LongConnectionClient(BASE_URL)
+++    # Build URL from CLI args (override defaults if provided)
+++    vla_url = f"http://{args.host}:{args.port}"
+++    logging.info(f"Connecting to VLA server at {vla_url}")
+++    client = LongConnectionClient(vla_url, max_retries=3)
++ 
++     # Initialize ACT temporal moving-averge smoother
++     temporal_ensembler = ACTTemporalEnsembler(temporal_ensemble_coeff=0.01,
++@@ -129,6 +179,12 @@ def run_eval(args: argparse.Namespace) -> None:
++             maxlen=16),  # NOTE: HAND CODE AS THE MODEL PREDCIT FUTURE 16 STEPS
++     }
++ 
+++    # Initialize FK/IK solver for G1 arm (converts between joint angles and EE poses)
+++    arm_ik = None
+++    if args.robot_type in ("g1_dex1", "g1_realsense"):
+++        logging.info("Initializing G1 Arm IK/FK solver...")
+++        arm_ik = G1_29_ArmIK(unit_test=False, visualization=False)
+++
++     env = make_real_env(
++         robot_type=args.robot_type,
++         dt=1 / args.control_freq,
++@@ -140,14 +196,21 @@ def run_eval(args: argparse.Namespace) -> None:
++             output_dir = Path(args.output_dir) / f"episode_{episode_idx:03d}"
++             output_dir.mkdir(parents=True, exist_ok=True)
++             run_policy(args, env, client, temporal_ensembler, cond_obs_queues,
++-                       output_dir)
+++                       output_dir, arm_ik=arm_ik)
++     finally:
++         env.close()
++-    env.close()
++ 
++ 
++ def get_parser() -> argparse.ArgumentParser:
++     parser = argparse.ArgumentParser()
+++    parser.add_argument("--host",
+++                        type=str,
+++                        default=HOST,
+++                        help=f"VLA server host (default: {HOST})")
+++    parser.add_argument("--port",
+++                        type=int,
+++                        default=PORT,
+++                        help=f"VLA server port (default: {PORT})")
++     parser.add_argument("--robot_type",
++                         type=str,
++                         default="g1_dex1",
++@@ -195,4 +258,8 @@ def get_parser() -> argparse.ArgumentParser:
++ if __name__ == "__main__":
++     parser = get_parser()
++     args = parser.parse_args()
++-    run_eval(args)
+++    
+++    try:
+++        run_eval(args)
+++    except KeyboardInterrupt:
+++        logging.info("\n[Client] Ctrl+C received - shutting down gracefully...")
++diff --git a/unitree_deploy/unitree_deploy/robot/robot_configs.py b/unitree_deploy/unitree_deploy/robot/robot_configs.py
++index a6acaea..d4a82c7 100644
++--- a/unitree_deploy/unitree_deploy/robot/robot_configs.py
+++++ b/unitree_deploy/unitree_deploy/robot/robot_configs.py
++@@ -110,15 +110,27 @@ def z1_dual_intelrealsense_camera_default_factory():
++     }
++ 
++ 
+++def g1_intelrealsense_camera_default_factory():
+++    """G1 with Intel RealSense D435i camera on head"""
+++    return {
+++        "cam_right_high": IntelRealSenseCameraConfig(
+++            serial_number="348522076577",  # G1头部D435i序列号
+++            fps=30,
+++            width=640,
+++            height=480,
+++        ),
+++    }
+++
+++
++ def g1_image_client_default_factory():
++     return {
++         "imageclient": ImageClientCameraConfig(
++             head_camera_type="opencv",
++             head_camera_id_numbers=[4],
++-            head_camera_image_shape=[480, 1280],  # Head camera resolution
++-            wrist_camera_type="opencv",
++-            wrist_camera_id_numbers=[0, 2],
++-            wrist_camera_image_shape=[480, 640],  # Wrist camera resolution
+++            head_camera_image_shape=[480, 640],  # Head camera resolution
+++            wrist_camera_type=None,
+++            wrist_camera_id_numbers=None,
+++            wrist_camera_image_shape=None,
++             aspect_ratio_threshold=2.0,
++             fps=30,
++             mock=False,
++@@ -164,7 +176,7 @@ def usb_camera_default_factory():
++ def dex1_default_factory():
++     return {
++         "left": Dex1_GripperConfig(
++-            unit_test=True,
+++            unit_test=False,
++             motors={
++                 "kLeftGripper": [0, "z1_gripper-joint"],
++             },
++@@ -172,7 +184,7 @@ def dex1_default_factory():
++             topic_gripper_command="rt/dex1/left/cmd",
++         ),
++         "right": Dex1_GripperConfig(
++-            unit_test=True,
+++            unit_test=False,
++             motors={
++                 "kRightGripper": [1, "z1_gripper-joint"],
++             },
++@@ -274,3 +286,12 @@ class G1_Dex1_Imageclint_RobotConfig(UnitreeRobotConfig):
++     cameras: dict[str, CameraConfig] = field(default_factory=g1_image_client_default_factory)
++     arm: dict[str, ArmConfig] = field(default_factory=g1_dual_arm_default_factory)
++     endeffector: dict[str, EndEffectorConfig] = field(default_factory=dex1_default_factory)
+++
+++
+++# =============================== Arm:g1, Camera:intelrealsense (D435i) ========================================
+++@RobotConfig.register_subclass("g1_realsense")
+++@dataclass
+++class G1_Realsense_RobotConfig(UnitreeRobotConfig):
+++    """G1 with Intel RealSense D435i camera on head (no gripper, direct arm control)"""
+++    cameras: dict[str, CameraConfig] = field(default_factory=g1_intelrealsense_camera_default_factory)
+++    arm: dict[str, ArmConfig] = field(default_factory=g1_dual_arm_default_factory)
++diff --git a/unitree_deploy/unitree_deploy/robot/robot_utils.py b/unitree_deploy/unitree_deploy/robot/robot_utils.py
++index 746a5e5..c432444 100644
++--- a/unitree_deploy/unitree_deploy/robot/robot_utils.py
+++++ b/unitree_deploy/unitree_deploy/robot/robot_utils.py
++@@ -2,6 +2,7 @@ from typing import Protocol
++ 
++ from unitree_deploy.robot.robot_configs import (
++     G1_Dex1_Imageclint_RobotConfig,
+++    G1_Realsense_RobotConfig,
++     RobotConfig,
++     Z1_Realsense_RobotConfig,
++     Z1dual_Dex1_Opencv_RobotConfig,
++@@ -32,6 +33,8 @@ def make_robot_config(robot_type: str, **kwargs) -> RobotConfig:
++         return Z1dual_Dex1_Opencv_RobotConfig(**kwargs)
++     elif robot_type == "g1_dex1":
++         return G1_Dex1_Imageclint_RobotConfig(**kwargs)
+++    elif robot_type == "g1_realsense":
+++        return G1_Realsense_RobotConfig(**kwargs)
++     else:
++         raise ValueError(f"Robot type '{robot_type}' is not available.")
++ 
++diff --git a/unitree_deploy/unitree_deploy/robot_devices/arm/g1_arm.py b/unitree_deploy/unitree_deploy/robot_devices/arm/g1_arm.py
++index 44d0f3b..9eb9138 100644
++--- a/unitree_deploy/unitree_deploy/robot_devices/arm/g1_arm.py
+++++ b/unitree_deploy/unitree_deploy/robot_devices/arm/g1_arm.py
++@@ -103,7 +103,17 @@ class G1_29_ArmController:
++                 self._subscribe_motor_state, name="g1._subscribe_motor_state"
++             )
++ 
+++            # Wait for DDS data with timeout (10 seconds)
+++            timeout = 10.0
+++            start_time = time.time()
++             while not self.lowstate_buffer.get_data():
+++                if time.time() - start_time > timeout:
+++                    log_warning(
+++                        f"⚠️ [G1_29_ArmController] Timeout waiting for DDS data. "
+++                        f"Arm may not be connected. Running in fallback mode."
+++                    )
+++                    # Initialize with default zero state if no data received
+++                    break
++                 time.sleep(0.01)
++                 log_warning("[G1_29_ArmController] Waiting to subscribe dds...")
++ 
++@@ -330,7 +340,8 @@ class G1_29_ArmController:
++         return self.g1_arm_ik.solve_tau(current_arm_q, current_arm_dq)
++ 
++     def arm_fk(self, q: np.ndarray | None = None) -> np.ndarray | None:
++-        pass
+++        """Compute forward kinematics for both arms using the IK solver."""
+++        return self.g1_arm_ik.solve_fk(q)
++ 
++     def go_start(self):
++         self._drive_to_waypoint(target_pose=self.init_pose, t_insert_time=2.0)
++@@ -354,7 +365,23 @@ class G1_29_ArmController:
++ 
++     def disconnect(self):
++         self.is_connected = False
++-        self.go_home()
+++        try:
+++            # Stop publish thread first to prevent race conditions
+++            if hasattr(self, 'stop_event'):
+++                self.stop_event.set()
+++            if hasattr(self, 'publish_thread') and self.publish_thread.is_alive():
+++                self.publish_thread.join(timeout=2.0)
+++            
+++            # Try to go home gracefully (may fail during Ctrl+C)
+++            try:
+++                self._drive_to_waypoint(target_pose=self.init_pose, t_insert_time=1.5)
+++                log_success("[G1_29_ArmController] Returned to home position before disconnect")
+++            except KeyboardInterrupt:
+++                log_warning("[G1_29_ArmController] Interrupted during go_home - skipping graceful return")
+++            except Exception as e:
+++                log_error(f"[G1_29_ArmController] Error returning home: {e}")
+++        except Exception as e:
+++            log_error(f"[G1_29_ArmController] Error during disconnect: {e}")
++ 
++     def _is_weak_motor(self, motor_index):
++         weak_motors = [
++diff --git a/unitree_deploy/unitree_deploy/robot_devices/arm/g1_arm_ik.py b/unitree_deploy/unitree_deploy/robot_devices/arm/g1_arm_ik.py
++index 9781401..73c7051 100644
++--- a/unitree_deploy/unitree_deploy/robot_devices/arm/g1_arm_ik.py
+++++ b/unitree_deploy/unitree_deploy/robot_devices/arm/g1_arm_ik.py
++@@ -7,6 +7,10 @@ from pinocchio.visualize import MeshcatVisualizer
++ 
++ from unitree_deploy.utils.weighted_moving_filter import WeightedMovingFilter
++ 
+++# Get absolute path to the package directory for URDF loading
+++import os
+++_ASSET_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "assets", "g1")
+++
++ 
++ class G1_29_ArmIK:
++     def __init__(self, unit_test=False, visualization=False):
++@@ -15,15 +19,19 @@ class G1_29_ArmIK:
++         self.unit_test = unit_test
++         self.visualization = visualization
++ 
+++        urdf_path = os.path.join(_ASSET_DIR, "g1_body29_hand14.urdf")
+++        if not os.path.exists(urdf_path):
+++            raise FileNotFoundError(f"URDF file not found: {urdf_path}")
+++
++         if not self.unit_test:
++             self.robot = pin.RobotWrapper.BuildFromURDF(
++-                "unitree_deploy/robot_devices/assets/g1/g1_body29_hand14.urdf",
++-                "unitree_deploy/robot_devices/assets/g1/",
+++                urdf_path,
+++                _ASSET_DIR,
++             )
++         else:
++             self.robot = pin.RobotWrapper.BuildFromURDF(
++-                "unitree_deploy/robot_devices/assets/g1/g1_body29_hand14.urdf",
++-                "unitree_deploy/robot_devices/assets/g1/",
+++                urdf_path,
+++                _ASSET_DIR,
++             )  # for test
++ 
++         self.mixed_jointsToLockIDs = [
++@@ -81,6 +89,9 @@ class G1_29_ArmIK:
++             )
++         )
++ 
+++        # Recreate data after adding custom frames so oMf has the right size
+++        self.reduced_robot.data = self.reduced_robot.model.createData()
+++
++         # for i in range(self.reduced_robot.model.nframes):
++         #     frame = self.reduced_robot.model.frames[i]
++         #     frame_id = self.reduced_robot.model.getFrameId(frame.name)
++@@ -277,4 +288,152 @@ class G1_29_ArmIK:
++ 
++         except Exception as e:
++             print(f"ERROR in convergence, plotting debug info.{e}")
++-            return np.zeros(self.reduced_robot.model.nv)
++\ No newline at end of file
+++            return np.zeros(self.reduced_robot.model.nv)
+++
+++    def solve_fk(self, q: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+++        """
+++        Compute forward kinematics for left and right end-effectors.
+++
+++        Args:
+++            q: Joint angles for the reduced robot (14D: 7 per arm).
+++
+++        Returns:
+++            (left_ee, right_ee): Each is a dict with keys:
+++                'position': np.ndarray of shape (3,) - XYZ position in base frame
+++                'rotation': np.ndarray of shape (3,3) - rotation matrix
+++        """
+++        pin.framesForwardKinematics(self.reduced_robot.model, self.reduced_robot.data, q)
+++
+++        left_se3 = self.reduced_robot.data.oMf[self.L_hand_id]
+++        right_se3 = self.reduced_robot.data.oMf[self.R_hand_id]
+++
+++        left_ee = {
+++            'position': left_se3.translation.copy(),
+++            'rotation': left_se3.rotation.copy(),
+++        }
+++        right_ee = {
+++            'position': right_se3.translation.copy(),
+++            'rotation': right_se3.rotation.copy(),
+++        }
+++        return left_ee, right_ee
+++
+++    def rotation_to_r6(self, rot_matrix: np.ndarray) -> np.ndarray:
+++        """
+++        Convert a 3x3 rotation matrix to 6D rotation representation.
+++        R6 = first two rows of the rotation matrix, flattened.
+++
+++        Args:
+++            rot_matrix: 3x3 rotation matrix
+++
+++        Returns:
+++            np.ndarray of shape (6,)
+++        """
+++        return rot_matrix[:2, :].flatten()
+++
+++    def joints_to_ee_proprio_23d(
+++        self,
+++        arm_q: np.ndarray,
+++        gripper_left_q: float = 0.0,
+++        gripper_right_q: float = 0.0,
+++        waist_rpy: np.ndarray | None = None,
+++    ) -> np.ndarray:
+++        """
+++        Convert robot joint states to the 23D end-effector proprio format
+++        expected by the VLA model.
+++
+++        23D layout:
+++            [0-2]   Left EEF XYZ position
+++            [3-8]   Left EEF R6 rotation (first two rows of rotation matrix, flattened)
+++            [9-11]  Right EEF XYZ position
+++            [12-17] Right EEF R6 rotation
+++            [18]    Right gripper open/close
+++            [19]    Left gripper open/close
+++            [20-22] Waist/body RPY (defaults to zeros)
+++
+++        Args:
+++            arm_q: 14D joint angles for both arms (7 per arm).
+++            gripper_left_q: Left gripper joint value (scalar).
+++            gripper_right_q: Right gripper joint value (scalar).
+++            waist_rpy: Optional 3D waist roll-pitch-yaw. Defaults to zeros.
+++
+++        Returns:
+++            np.ndarray of shape (23,) in the VLA proprio format.
+++        """
+++        left_ee, right_ee = self.solve_fk(arm_q)
+++        left_r6 = self.rotation_to_r6(left_ee['rotation'])
+++        right_r6 = self.rotation_to_r6(right_ee['rotation'])
+++
+++        if waist_rpy is None:
+++            waist_rpy = np.zeros(3)
+++
+++        proprio = np.concatenate([
+++            left_ee['position'],       # 0-2:  Left XYZ
+++            left_r6,                    # 3-8:  Left R6
+++            right_ee['position'],      # 9-11: Right XYZ
+++            right_r6,                   # 12-17: Right R6
+++            np.array([gripper_right_q]),  # 18: Right gripper
+++            np.array([gripper_left_q]),   # 19: Left gripper
+++            waist_rpy,                  # 20-22: Waist RPY
+++        ])
+++
+++        return proprio
+++
+++    def ee_proprio_23d_to_arm_ik(
+++        self,
+++        proprio_23d: np.ndarray,
+++        current_arm_q: np.ndarray | None = None,
+++        current_arm_dq: np.ndarray | None = None,
+++    ) -> tuple[np.ndarray, np.ndarray]:
+++        """
+++        Convert a 23D end-effector proprio/action target back to joint angles via IK.
+++
+++        Args:
+++            proprio_23d: 23D target in VLA format.
+++            current_arm_q: Current 14D arm joint angles for IK warm start.
+++            current_arm_dq: Current 14D arm joint velocities.
+++
+++        Returns:
+++            (sol_q, sol_tauff): Joint angles and torques.
+++        """
+++        left_pos = proprio_23d[0:3]
+++        left_r6 = proprio_23d[3:9]
+++        right_pos = proprio_23d[9:12]
+++        right_r6 = proprio_23d[12:18]
+++
+++        left_rot = self._r6_to_rotation(left_r6)
+++        right_rot = self._r6_to_rotation(right_r6)
+++
+++        left_tf = np.eye(4)
+++        left_tf[:3, :3] = left_rot
+++        left_tf[:3, 3] = left_pos
+++
+++        right_tf = np.eye(4)
+++        right_tf[:3, :3] = right_rot
+++        right_tf[:3, 3] = right_pos
+++
+++        return self.solve_ik(left_tf, right_tf, current_arm_q, current_arm_dq)
+++
+++    def _r6_to_rotation(self, r6: np.ndarray) -> np.ndarray:
+++        """
+++        Convert 6D rotation representation back to a 3x3 rotation matrix.
+++        Uses Gram-Schmidt orthogonalization on the first two rows.
+++
+++        Args:
+++            r6: np.ndarray of shape (6,) - flattened first two rows of rotation matrix.
+++
+++        Returns:
+++            np.ndarray of shape (3,3) - orthogonal rotation matrix.
+++        """
+++        r6_flat = np.asarray(r6).flatten()
+++        r1 = r6_flat[:3]
+++        r2 = r6_flat[3:6]
+++
+++        # Gram-Schmidt: make r1 unit, then r2 orthogonal to r1 and unit
+++        r1 = r1 / (np.linalg.norm(r1) + 1e-8)
+++        r2 = r2 - np.dot(r2, r1) * r1
+++        r2 = r2 / (np.linalg.norm(r2) + 1e-8)
+++
+++        # r3 = r1 x r2
+++        r3 = np.cross(r1, r2)
+++
+++        return np.stack([r1, r2, r3], axis=0)
++\ No newline at end of file
++diff --git a/unitree_deploy/unitree_deploy/robot_devices/cameras/imageclient.py b/unitree_deploy/unitree_deploy/robot_devices/cameras/imageclient.py
++index 76f31a9..f37b003 100644
++--- a/unitree_deploy/unitree_deploy/robot_devices/cameras/imageclient.py
+++++ b/unitree_deploy/unitree_deploy/robot_devices/cameras/imageclient.py
++@@ -28,7 +28,7 @@ class ImageClient:
++         wrist_img_shape=None,
++         wrist_img_shm_name=None,
++         image_show=False,
++-        server_address="192.168.123.164",
+++        server_address="192.168.0.109",  # G1机器人IP地址
++         port=5555,
++         unit_test=False,
++     ):
++@@ -296,15 +296,25 @@ class ImageClientCamera:
++ 
++     def disconnect(self):
++         if not self.is_connected:
++-            raise RobotDeviceNotConnectedError(
++-                f"ImageClient({self.camera_index}) is not connected. Try running `camera.connect()` first."
++-            )
+++            return
++ 
++-        self.tv_img_shm.unlink()
++-        self.tv_img_shm.close()
++-        if self.has_wrist_camera:
++-            self.wrist_img_shm.unlink()
++-            self.wrist_img_shm.close()
+++        try:
+++            self.tv_img_shm.unlink()
+++        except FileNotFoundError:
+++            pass
+++        try:
+++            self.tv_img_shm.close()
+++        except FileNotFoundError:
+++            pass
+++        if self.has_wrist_camera and self.wrist_img_shm is not None:
+++            try:
+++                self.wrist_img_shm.unlink()
+++            except FileNotFoundError:
+++                pass
+++            try:
+++                self.wrist_img_shm.close()
+++            except FileNotFoundError:
+++                pass
++         self.is_connected = False
++ 
++     def __del__(self):
++diff --git a/unitree_deploy/unitree_deploy/robot_devices/endeffector/gripper.py b/unitree_deploy/unitree_deploy/robot_devices/endeffector/gripper.py
++index c8d7a4b..28e3b9a 100644
++--- a/unitree_deploy/unitree_deploy/robot_devices/endeffector/gripper.py
+++++ b/unitree_deploy/unitree_deploy/robot_devices/endeffector/gripper.py
++@@ -91,7 +91,23 @@ class Dex1_Gripper_Controller:
++             self.subscribe_state_thread.daemon = True
++             self.subscribe_state_thread.start()
++ 
+++            # Wait for DDS data with timeout (5 seconds)
+++            timeout = 5.0
+++            start_time = time.time()
++             while not self.lowstate_buffer.get_data():
+++                if time.time() - start_time > timeout:
+++                    log_warning(
+++                        f"⚠️ [Dex1_Gripper_Controller] Timeout waiting for DDS data on '{self.topic_gripper_state}'. "
+++                        f"Gripper may not be connected. Running in fallback mode."
+++                    )
+++                    # Initialize with default zero state if no data received
+++                    lowstate = Gripper_LowState()
+++                    for idx, _ in enumerate(Gripper_Sigle_JointIndex):
+++                        lowstate.motor_state[idx].q = 0.0
+++                        lowstate.motor_state[idx].dq = 0.0
+++                    self.lowstate_buffer.set_data(lowstate)
+++                    break
+++
++                 time.sleep(0.01)
++                 log_warning("[Dex1_Gripper_Controller] Waiting to subscribe dds...")
++ 
++diff --git a/unitree_deploy/unitree_deploy/utils/eval_utils.py b/unitree_deploy/unitree_deploy/utils/eval_utils.py
++index 97afea7..bf1e475 100644
++--- a/unitree_deploy/unitree_deploy/utils/eval_utils.py
+++++ b/unitree_deploy/unitree_deploy/utils/eval_utils.py
++@@ -1,3 +1,4 @@
+++import json
++ import logging
++ import sys
++ import time
++@@ -18,54 +19,163 @@ from datasets import load_from_disk
++ from datasets.features.features import register_feature
++ from safetensors.torch import load_file
++ 
+++import json_numpy
+++
++ logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
++ 
++ 
+++class NumpyEncoder(json.JSONEncoder):
+++    """Custom JSON encoder that handles numpy arrays."""
+++    def default(self, obj):
+++        if isinstance(obj, np.ndarray):
+++            return obj.tolist()
+++        if isinstance(obj, (np.integer,)):
+++            return int(obj)
+++        if isinstance(obj, (np.floating,)):
+++            return float(obj)
+++        if isinstance(obj, np.bool_):
+++            return bool(obj)
+++        return super().default(obj)
+++
+++
++ class LongConnectionClient:
++-    def __init__(self, base_url):
+++    def __init__(self, base_url, max_retries=3):
++         self.session = requests.Session()
++         self.base_url = base_url
+++        self.max_retries = max_retries
++ 
++-    def send_post(self, endpoint, json_data):
++-        """send POST request to  endpoint"""
+++    def send_post(self, endpoint, json_data, timeout=30.0):
+++        """send POST request to VLA server with retry logic"""
++         url = f"{self.base_url}{endpoint}"
++-        response = None
++-        while True:
+++        
+++        for attempt in range(1, self.max_retries + 1):
++             try:
++-                response = self.session.post(url, json=json_data)
+++                logging.info(f"Sending request to {url} (attempt {attempt}/{self.max_retries})")
+++                # Use json_numpy to properly serialize numpy arrays
+++                payload = json_numpy.dumps(json_data)
+++                response = self.session.post(url, data=payload, 
+++                                            headers={"Content-Type": "application/json"},
+++                                            timeout=timeout)
+++                
++                 if response.status_code == 200:
++                     data = response.json()
++-                    if data["result"] == "ok":
++-                        response = data
++-                        break
++-                    else:
++-                        logging.info(data["desc"])
++-
++-                time.sleep(1)
+++                    # Check if it's an error string
+++                    if isinstance(data, str) and data == "error":
+++                        logging.error(f"VLA server returned 'error' - check request format. Payload size: {len(payload)} bytes")
+++                        continue  # retry on next iteration
+++                    # Server may return json_numpy-encoded string in double-encode mode
+++                    if isinstance(data, str):
+++                        data = json_numpy.loads(data)
+++                    
+++                    return data
+++                    
+++                # Non-200 status code - log and retry
+++                logging.warning(f"HTTP {response.status_code}: {response.text[:200]}")
+++                        
+++            except requests.exceptions.ConnectionError as e:
+++                logging.error(f"[Attempt {attempt}/{self.max_retries}] Connection failed to {url}: {e}")
+++            except requests.exceptions.Timeout as e:
+++                logging.error(f"[Attempt {attempt}/{self.max_retries}] Request timed out: {e}")
++             except Exception as e:
++-                logging.error(f"An error occurred: {e}")
++-                logging.error(traceback.format_exc())
++-
++-        return response
+++                logging.error(f"[Attempt {attempt}/{self.max_retries}] An error occurred: {e}")
+++            
+++            # Wait before retry (don't wait on last attempt)
+++            if attempt < self.max_retries:
+++                wait_time = 2 ** (attempt - 1)  # exponential backoff: 1s, 2s...
+++                logging.info(f"Retrying in {wait_time}s...")
+++                time.sleep(wait_time)
+++        
+++        raise ConnectionError(
+++            f"Failed to connect to VLA server at {url} after {self.max_retries} attempts. "
+++            f"Please check if the server is running and reachable."
+++        )
++ 
++     def close(self):
++-        """ "close session"""
+++        """close session"""
++         self.session.close()
++ 
++-    def predict_action(self, language_instruction, batch) -> torch.Tensor:
++-        # collect data
++-        data = {
++-            "language_instruction": language_instruction,
++-            "observation.state": torch.stack(list(batch["observation.state"])).tolist(),
++-            "observation.images.top": torch.stack(list(batch["observation.images.top"])).tolist(),
++-            "action": torch.stack(list(batch["action"])).tolist(),
+++    def predict_action(self, language_instruction, batch, arm_ik=None,
+++                       gripper_left_q=0.0, gripper_right_q=0.0) -> torch.Tensor:
+++        """
+++        Send observation to VLA server and get predicted action.
+++        
+++        VLA server expects format per unifolm-vla API (double-encoded):
+++        {
+++            "encoded": "{\"observations\": [{\"full_image\": numpy_array, \"state\": numpy_array, \"instruction\": str}]}"
++         }
++-
++-        # send data
++-        endpoint = "/predict_action"
+++        
+++        Server returns action array of shape (25 timesteps, 23 dims) for G1 tasks.
+++        We return the first timestep's action as the prediction to execute.
+++        
+++        Args:
+++            language_instruction: Task description string.
+++            batch: Observation dict with queues.
+++            arm_ik: G1_29_ArmIK instance for computing FK to convert 14D joints -> 23D proprio.
+++            gripper_left_q: Current left gripper joint value.
+++            gripper_right_q: Current right gripper joint value.
+++        """
+++        # Extract the latest observation from batch queues
+++        state = list(batch["observation.state"])[-1]  # most recent frame
+++        image = list(batch["observation.images.top"])[-1]  # most recent image
+++        
+++        # Convert tensors to numpy for JSON serialization
+++        # Image: (C, H, W) -> (H, W, C), values in [0, 255] uint8
+++        if image.dim() == 3:
+++            img_np = image.permute(1, 2, 0).cpu().numpy()
+++            # Ensure uint8 format for VLA server
+++            if img_np.dtype != np.uint8:
+++                if img_np.min() < 0 or img_np.max() <= 1.0:
+++                    img_np = (img_np * 255).astype(np.uint8)
+++                else:
+++                    img_np = img_np.astype(np.uint8)
+++        
+++        # State: proprioception - convert joint angles to 23D EE proprio via FK
+++        state_np = state.cpu().numpy().astype(np.float64)
+++        
+++        if arm_ik is not None and len(state_np) in (14, 16):
+++            # Extract arm joints (first 14D) and gripper values (if 16D)
+++            arm_q = state_np[:14]
+++            gripper_l = float(state_np[14]) if len(state_np) > 14 else gripper_left_q
+++            gripper_r = float(state_np[15]) if len(state_np) > 15 else gripper_right_q
+++            state_23d = arm_ik.joints_to_ee_proprio_23d(
+++                arm_q=arm_q,
+++                gripper_left_q=gripper_l,
+++                gripper_right_q=gripper_r,
+++            )
+++        else:
+++            state_23d = state_np
+++        
+++        logging.debug(f"Image: dtype={img_np.dtype}, shape={img_np.shape}, range=[{img_np.min()}, {img_np.max()}]")
+++        logging.debug(f"State: shape={state_23d.shape}, values={[round(float(x),3) for x in state_23d[:6]]}...")
+++        
+++        # Build VLA server request format with raw numpy arrays
+++        observations = [{
+++            "full_image": img_np,       # HxWx3 numpy array
+++            "state": state_23d,         # 23D proprioception numpy array
+++            "instruction": language_instruction,
+++        }]
+++        
+++        inner_payload = {"observations": observations}
+++        
+++        # Use double-encode: serialize inner payload with json_numpy to preserve numpy arrays,
+++        # then wrap in "encoded" field so server's json.loads can reconstruct them properly
+++        encoded_str = json_numpy.dumps(inner_payload)
+++        data = {"encoded": encoded_str}
+++        
+++        endpoint = "/act"
++         response = self.send_post(endpoint, data)
++-        # action = torch.tensor(response['action']).unsqueeze(0)
++-        action = torch.tensor(response["action"])
+++        
+++        # VLA server returns action array of shape (25 timesteps, 23 dims) for G1 tasks
+++        # Response may already be numpy array (from json_numpy) or nested list
+++        action_np = np.array(response, dtype=np.float32)
+++        logging.debug(f"VLA returned action shape: {action_np.shape}")
+++        
+++        # Return the first timestep's action as prediction to execute now
+++        if action_np.ndim == 2 and action_np.shape[0] > 1:
+++            action = torch.tensor(action_np[0]).float()  # First step only
+++        else:
+++            action = torch.tensor(action_np).float()
+++        
++         return action
++ 
++ 
+diff --git a/robot_teleimager.patch b/robot_teleimager.patch
+new file mode 100644
+index 0000000..e9e6474
+--- /dev/null
++++ b/robot_teleimager.patch
+@@ -0,0 +1,139 @@
++diff --git a/cam_config_server.yaml b/cam_config_server.yaml
++index 15c0376..fa05dc1 100644
++--- a/cam_config_server.yaml
+++++ b/cam_config_server.yaml
++@@ -1,94 +1,50 @@
++-# =====================================================
++-# Global WebRTC encoder config (applies to ALL cameras).
++-# aiortc bitrate caps are module-level, so this is shared by every track.
++-# Tune by network: WiFi6 5GHz dedicated -> max ~12M; WiFi5 shared -> max ~8M; public -> max ~4M.
++-# =====================================================
++-webrtc:
++-  bitrate:
++-    min: 2000000      # floor under congestion
++-    default: 5000000  # startup rate, skips slow-start
++-    max: 12000000     # quality ceiling on healthy network
++-  gop_length: 60      # frames between keyframes; lower = faster recovery from packet loss
++-
++-# =====================================================
++-# Head camera configuration
++-# =====================================================
++-# camera topic
++ head_camera:
++-  # camera config
++-
++-  # if enable_zmq and enable_webrtc are both false, the camera will not start
++-  # Set to true to enable ZMQ publishing, false to disable
++-  enable_zmq: true
++-  # Port to publish camera stream, e.g. zmq tcp://*:55555.  image_client.py should connect to the same port
++-  zmq_port : 55555
++-  # Set to true to enable WebRTC publishing, false to disable
+++  binocular: false
++   enable_webrtc: true
++-  # Port for WebRTC signaling server
++-  webrtc_port : 60001
++-  # webrtc codec preference, options: "vp8", "h264"
++-  webrtc_codec: h264
++-
++-  # Type of camera:
++-  #   - "opencv"    → opencv driver
++-  #   - "realsense" → pyrealsense2 driver
++-  #   - "uvc"       → pyuvc driver
++-  type: uvc
++-
++-  # Image Format
++-  # image resolution: [height, width]
++-  image_shape: [480, 1280]
++-  binocular: true
++-  # frame per second
+++  enable_zmq: true
++   fps: 30
++-
++-  # Camera identifiers (choose one or more):
++-  #   - video_id: X        → /dev/videoX  (e.g. 0 → /dev/video0)
++-  #   - serial_number: Y   → camera's hardware serial (e.g. 141722079879)
++-  #   - physical_path: Z   → sysfs physical USB path (e.g. /sys/devices/pci0000:00/.../1-11.2:1.0)
++-  #
++-  # Identifier priority:
++-  #   physical_path > serial_number > video_id
++-  #   if an identifier is not used, set it to null. The system will resolve the camera by priority.
++-  #
++-  # Notes:
++-  #   - type "realsense": supports serial_number only (but a RealSense can also be used as opencv/uvc if desired)
++-  #   - type "opencv":    supports video_id, serial_number, physical_path
++-  #   - type "uvc":       supports video_id, serial_number, physical_path
++-  video_id: 0
++-  serial_number: 01.00.00
+++  image_shape:
+++  - 720
+++  - 1280
++   physical_path: null
++-
++-# =====================================================
++-# Left wrist camera configuration
++-# =====================================================
++-left_wrist_camera:
++-  enable_zmq: true
++-  zmq_port : 55556
++-  enable_webrtc: true
++-  webrtc_port : 60002
+++  serial_number: '348522076577'
+++  type: realsense
+++  video_id: null
++   webrtc_codec: h264
++-  type: uvc
++-  image_shape: [480, 640]
+++  webrtc_port: 60001
+++  zmq_port: 55555
+++left_wrist_camera:
++   binocular: false
+++  enable_webrtc: true
+++  enable_zmq: true
++   fps: 30
++-  video_id: 2
++-  serial_number: 200901010001
+++  image_shape:
+++  - 720
+++  - 1280
++   physical_path: null
++-
++-# =====================================================
++-# Right wrist camera configuration
++-# =====================================================
++-right_wrist_camera:
++-  enable_zmq: true
++-  zmq_port : 55557
++-  enable_webrtc: true
++-  webrtc_port: 60003
++-  webrtc_codec: h264
+++  serial_number: JR0001
++   type: uvc
++-  image_shape: [480, 640]
+++  video_id: 2
+++  webrtc_codec: h264
+++  webrtc_port: 60002
+++  zmq_port: 55556
+++right_wrist_camera:
++   binocular: false
+++  enable_webrtc: false
+++  enable_zmq: false
++   fps: 30
++-  video_id: 4
++-  serial_number: 200901010002
++-  physical_path: null
++\ No newline at end of file
+++  image_shape:
+++  - 480
+++  - 640
+++  physical_path: null
+++  serial_number: null
+++  type: uvc
+++  video_id: null
+++  webrtc_port: null
+++  zmq_port: null
+++webrtc:
+++  bitrate:
+++    default: 5000000
+++    max: 12000000
+++    min: 2000000
+++  gop_length: 60
+diff --git a/robot_televuer.patch b/robot_televuer.patch
+new file mode 100644
+index 0000000..77c9aae
+--- /dev/null
++++ b/robot_televuer.patch
+@@ -0,0 +1,36 @@
++diff --git a/example/test_televuer.py b/example/test_televuer.py
++index b9111b8..34c95d1 100644
++--- a/example/test_televuer.py
+++++ b/example/test_televuer.py
++@@ -14,7 +14,7 @@ def run_test_TeleVuer():
++     use_hand_track = False
++     # teleimager, if you want to test real image streaming, make sure teleimager server is running
++     from teleimager.image_client import ImageClient
++-    img_client = ImageClient(host="192.168.123.164")
+++    img_client = ImageClient(host="192.168.0.109", request_bgr=True)
++     camera_config = img_client.get_cam_config()
++     # teleimager + televuer
++     tv = TeleVuer(use_hand_tracking=use_hand_track, 
++@@ -24,7 +24,7 @@ def run_test_TeleVuer():
++                   display_mode="immersive",   # "ego" or "immersive" or "pass-through"
++                   zmq=camera_config['head_camera']['enable_zmq'],
++                   webrtc=camera_config['head_camera']['enable_webrtc'],
++-                  webrtc_url=f"https://192.168.123.164:{camera_config['head_camera']['webrtc_port']}/offer"
+++                  webrtc_url=f"https://192.168.0.109:{camera_config['head_camera']['webrtc_port']}/offer"
++                   )
++     # pure televuer
++     # tv = TeleVuer(use_hand_tracking=use_hand_track, 
++@@ -41,7 +41,12 @@ def run_test_TeleVuer():
++         input("Press Enter to start TeleVuer test...")
++         running = True
++         while running:
++-            img, _= img_client.get_head_frame()
+++            tele_img = img_client.get_head_frame()
+++            img = tele_img.bgr
+++            if img is None:
+++                logger_mp.warning("Head camera frame is None, skipping render...")
+++                time.sleep(0.016)
+++                continue
++             tv.render_to_xr(img)
++ 
++             start_time = time.time()
 diff --git a/scripts/run_real_eval_server.sh b/scripts/run_real_eval_server.sh
 index f3c1947..0c44bf0 100644
 --- a/scripts/run_real_eval_server.sh
@@ -23,6 +1081,30 @@ index f3c1947..0c44bf0 100644
      --unconditional_guidance_scale 1.0 \
      --ddim_steps 16 \
      --ddim_eta 1.0 \
+diff --git a/unitree_deploy/run_vla_client.sh b/unitree_deploy/run_vla_client.sh
+new file mode 100755
+index 0000000..4c8a906
+--- /dev/null
++++ b/unitree_deploy/run_vla_client.sh
+@@ -0,0 +1,18 @@
++#!/bin/bash
++# VLA Client启动脚本 - G1 RealSense D435i配置
++# 服务器地址: http://192.168.0.102:8778
++
++cd /home/css/work/robot/unitree/vla/unifolm-world-model-action-geesun/unifolm-world-model-action/unitree_deploy
++
++source ~/miniconda3/etc/profile.d/conda.sh
++conda activate unitree_deploy
++
++python scripts/robot_client.py \
++    --host 192.168.0.102 \
++    --port 8778 \
++    --robot_type g1_dex1 \
++    --language_instruction "Pick up the object" \
++    --control_freq 30 \
++    --action_horizon 10 \
++    --exe_steps 10 \
++    --output_dir /home/css/work/vla_results
 diff --git a/unitree_deploy/scripts/robot_client.py b/unitree_deploy/scripts/robot_client.py
 index da98126..6e5ec51 100644
 --- a/unitree_deploy/scripts/robot_client.py

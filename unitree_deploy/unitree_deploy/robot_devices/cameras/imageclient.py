@@ -25,31 +25,42 @@ class ImageClient:
         self,
         tv_img_shape=None,
         tv_img_shm_name=None,
-        wrist_img_shape=None,
-        wrist_img_shm_name=None,
+        left_wrist_img_shape=None,
+        left_wrist_img_shm_name=None,
+        right_wrist_img_shape=None,
+        right_wrist_img_shm_name=None,
         image_show=False,
         server_address="192.168.0.109",  # G1机器人IP地址
-        port=5555,
+        head_port=55555,
+        left_wrist_port=55556,
+        right_wrist_port=55557,
         unit_test=False,
     ):
         """
         tv_img_shape: User's expected head camera resolution shape (H, W, C). It should match the output of the image service terminal.
         tv_img_shm_name: Shared memory is used to easily transfer images across processes to the Vuer.
-        wrist_img_shape: User's expected wrist camera resolution shape (H, W, C). It should maintain the same shape as tv_img_shape.
-        wrist_img_shm_name: Shared memory is used to easily transfer images.
+        left_wrist_img_shape: Left wrist camera resolution shape (H, W, C).
+        left_wrist_img_shm_name: Shared memory for left wrist camera.
+        right_wrist_img_shape: Right wrist camera resolution shape (H, W, C).
+        right_wrist_img_shm_name: Shared memory for right wrist camera.
         image_show: Whether to display received images in real time.
         server_address: The ip address to execute the image server script.
-        port: The port number to bind to. It should be the same as the image server.
+        head_port: ZMQ port for head camera.
+        left_wrist_port: ZMQ port for left wrist camera.
+        right_wrist_port: ZMQ port for right wrist camera.
         Unit_Test: When both server and client are True, it can be used to test the image transfer latency, \
                    network jitter, frame loss rate and other information.
         """
         self.running = True
         self._image_show = image_show
         self._server_address = server_address
-        self._port = port
+        self._head_port = head_port
+        self._left_wrist_port = left_wrist_port
+        self._right_wrist_port = right_wrist_port
 
         self.tv_img_shape = tv_img_shape
-        self.wrist_img_shape = wrist_img_shape
+        self.left_wrist_img_shape = left_wrist_img_shape
+        self.right_wrist_img_shape = right_wrist_img_shape
 
         self.tv_enable_shm = False
         if self.tv_img_shape is not None and tv_img_shm_name is not None:
@@ -57,11 +68,17 @@ class ImageClient:
             self.tv_img_array = np.ndarray(tv_img_shape, dtype=np.uint8, buffer=self.tv_image_shm.buf)
             self.tv_enable_shm = True
 
-        self.wrist_enable_shm = False
-        if self.wrist_img_shape is not None and wrist_img_shm_name is not None:
-            self.wrist_image_shm = shared_memory.SharedMemory(name=wrist_img_shm_name)
-            self.wrist_img_array = np.ndarray(wrist_img_shape, dtype=np.uint8, buffer=self.wrist_image_shm.buf)
-            self.wrist_enable_shm = True
+        self.left_wrist_enable_shm = False
+        if self.left_wrist_img_shape is not None and left_wrist_img_shm_name is not None:
+            self.left_wrist_image_shm = shared_memory.SharedMemory(name=left_wrist_img_shm_name)
+            self.left_wrist_img_array = np.ndarray(left_wrist_img_shape, dtype=np.uint8, buffer=self.left_wrist_image_shm.buf)
+            self.left_wrist_enable_shm = True
+
+        self.right_wrist_enable_shm = False
+        if self.right_wrist_img_shape is not None and right_wrist_img_shm_name is not None:
+            self.right_wrist_image_shm = shared_memory.SharedMemory(name=right_wrist_img_shm_name)
+            self.right_wrist_img_array = np.ndarray(right_wrist_img_shape, dtype=np.uint8, buffer=self.right_wrist_image_shm.buf)
+            self.right_wrist_enable_shm = True
 
         # Performance evaluation parameters
         self._enable_performance_eval = unit_test
@@ -135,67 +152,106 @@ class ImageClient:
             )
 
     def _close(self):
-        self._socket.close()
-        self._context.term()
+        for sock in getattr(self, '_sockets', []):
+            sock.close()
+        if hasattr(self, '_context'):
+            self._context.term()
         if self._image_show:
             cv2.destroyAllWindows()
         log_success("Image client has been closed.")
 
-    def receive_process(self):
-        # Set up ZeroMQ context and socket
-        self._context = zmq.Context()
-        self._socket = self._context.socket(zmq.SUB)
-        self._socket.connect(f"tcp://{self._server_address}:{self._port}")
-        self._socket.setsockopt_string(zmq.SUBSCRIBE, "")
+    def _receive_stream(self, port, img_shape, shm_array_func, label):
+        """Single camera ZMQ receive loop running in its own thread."""
+        sock = self._context.socket(zmq.SUB)
+        sock.connect(f"tcp://{self._server_address}:{port}")
+        sock.setsockopt_string(zmq.SUBSCRIBE, "")
+        self._sockets.append(sock)
 
-        log_warning("\nImage client has started, waiting to receive data...")
+        log_warning(f"[{label}] Connected to port {port}, waiting for data...")
         try:
             while self.running:
-                # Receive message
-                message = self._socket.recv()
+                message = sock.recv()
                 receive_time = time.time()
 
                 if self._enable_performance_eval:
                     header_size = struct.calcsize("dI")
                     try:
-                        # Attempt to extract header and image data
                         header = message[:header_size]
                         jpg_bytes = message[header_size:]
                         timestamp, frame_id = struct.unpack("dI", header)
                     except struct.error as e:
-                        log_error(f"[Image Client] Error unpacking header: {e}, discarding message.")
+                        log_error(f"[{label}] Error unpacking header: {e}, discarding message.")
                         continue
                 else:
-                    # No header, entire message is image data
                     jpg_bytes = message
-                # Decode image
+
                 np_img = np.frombuffer(jpg_bytes, dtype=np.uint8)
                 current_image = cv2.imdecode(np_img, cv2.IMREAD_COLOR)
                 if current_image is None:
-                    log_error("[Image Client] Failed to decode image.")
+                    log_error(f"[{label}] Failed to decode image.")
                     continue
 
-                if self.tv_enable_shm:
-                    np.copyto(self.tv_img_array, np.array(current_image[:, : self.tv_img_shape[1]]))
-
-                if self.wrist_enable_shm:
-                    np.copyto(self.wrist_img_array, np.array(current_image[:, -self.wrist_img_shape[1] :]))
-
-                if self._image_show:
-                    height, width = current_image.shape[:2]
-                    resized_image = cv2.resize(current_image, (width // 2, height // 2))
-                    cv2.imshow("Image Client Stream", resized_image)
-                    if cv2.waitKey(1) & 0xFF == ord("q"):
-                        self.running = False
+                shm_array = shm_array_func()
+                if shm_array is not None:
+                    if current_image.shape[:2] == shm_array.shape[:2]:
+                        np.copyto(shm_array, current_image)
+                    else:
+                        resized = cv2.resize(current_image, (shm_array.shape[1], shm_array.shape[0]))
+                        np.copyto(shm_array, resized)
 
                 if self._enable_performance_eval:
                     self._update_performance_metrics(timestamp, frame_id, receive_time)
                     self._print_performance_metrics(receive_time)
 
         except KeyboardInterrupt:
-            log_error("Image client interrupted by user.")
+            pass
         except Exception as e:
-            log_error(f"[Image Client] An error occurred while receiving data: {e}")
+            if self.running:
+                log_error(f"[{label}] An error occurred: {e}")
+
+    def receive_process(self):
+        self._context = zmq.Context()
+        self._sockets = []
+
+        log_warning("\nImage client has started, waiting to receive data...")
+
+        threads = []
+
+        if self.tv_enable_shm:
+            t = threading.Thread(
+                target=self._receive_stream,
+                args=(self._head_port, self.tv_img_shape,
+                      lambda: self.tv_img_array if self.tv_enable_shm else None,
+                      "HeadCamera"),
+                daemon=True)
+            threads.append(t)
+
+        if self.left_wrist_enable_shm:
+            t = threading.Thread(
+                target=self._receive_stream,
+                args=(self._left_wrist_port, self.left_wrist_img_shape,
+                      lambda: self.left_wrist_img_array if self.left_wrist_enable_shm else None,
+                      "LeftWristCamera"),
+                daemon=True)
+            threads.append(t)
+
+        if self.right_wrist_enable_shm:
+            t = threading.Thread(
+                target=self._receive_stream,
+                args=(self._right_wrist_port, self.right_wrist_img_shape,
+                      lambda: self.right_wrist_img_array if self.right_wrist_enable_shm else None,
+                      "RightWristCamera"),
+                daemon=True)
+            threads.append(t)
+
+        for t in threads:
+            t.start()
+
+        try:
+            while self.running:
+                time.sleep(0.5)
+        except KeyboardInterrupt:
+            self.running = False
         finally:
             self._close()
 
@@ -212,13 +268,17 @@ class ImageClientCamera:
         self.wrist_camera_id_numbers = config.wrist_camera_id_numbers
         self.aspect_ratio_threshold = config.aspect_ratio_threshold
         self.mock = config.mock
+        self.head_zmq_port = config.head_zmq_port
+        self.left_wrist_zmq_port = config.left_wrist_zmq_port
+        self.right_wrist_zmq_port = config.right_wrist_zmq_port
+        self.server_address = config.server_address
 
         self.is_binocular = (
             len(self.head_camera_id_numbers) > 1
             or self.head_camera_image_shape[1] / self.head_camera_image_shape[0] > self.aspect_ratio_threshold
-        )  # self.is_binocular
+        )
 
-        self.has_wrist_camera = self.wrist_camera_type is not None  # self.has_wrist_camera
+        self.has_wrist_camera = self.wrist_camera_type is not None
 
         self.tv_img_shape = (
             (self.head_camera_image_shape[0], self.head_camera_image_shape[1] * 2, 3)
@@ -229,28 +289,46 @@ class ImageClientCamera:
 
         self.tv_img_shm = shared_memory.SharedMemory(create=True, size=np.prod(self.tv_img_shape) * np.uint8().itemsize)
         self.tv_img_array = np.ndarray(self.tv_img_shape, dtype=np.uint8, buffer=self.tv_img_shm.buf)
-        self.wrist_img_shape = None
-        self.wrist_img_shm = None
+
+        self.left_wrist_img_shape = None
+        self.left_wrist_img_shm = None
+        self.left_wrist_img_array = None
+        self.right_wrist_img_shape = None
+        self.right_wrist_img_shm = None
+        self.right_wrist_img_array = None
 
         if self.has_wrist_camera:
-            self.wrist_img_shape = (self.wrist_camera_image_shape[0], self.wrist_camera_image_shape[1] * 2, 3)
-            self.wrist_img_shm = shared_memory.SharedMemory(
-                create=True, size=np.prod(self.wrist_img_shape) * np.uint8().itemsize
+            self.left_wrist_img_shape = (self.wrist_camera_image_shape[0], self.wrist_camera_image_shape[1], 3)
+            self.left_wrist_img_shm = shared_memory.SharedMemory(
+                create=True, size=np.prod(self.left_wrist_img_shape) * np.uint8().itemsize
             )
-            self.wrist_img_array = np.ndarray(self.wrist_img_shape, dtype=np.uint8, buffer=self.wrist_img_shm.buf)
+            self.left_wrist_img_array = np.ndarray(self.left_wrist_img_shape, dtype=np.uint8, buffer=self.left_wrist_img_shm.buf)
+
+            self.right_wrist_img_shape = (self.wrist_camera_image_shape[0], self.wrist_camera_image_shape[1], 3)
+            self.right_wrist_img_shm = shared_memory.SharedMemory(
+                create=True, size=np.prod(self.right_wrist_img_shape) * np.uint8().itemsize
+            )
+            self.right_wrist_img_array = np.ndarray(self.right_wrist_img_shape, dtype=np.uint8, buffer=self.right_wrist_img_shm.buf)
+
         self.img_shm_name = self.tv_img_shm.name
         self.is_connected = False
 
     def connect(self):
         try:
             if self.is_connected:
-                raise RobotDeviceAlreadyConnectedError(f"ImageClient({self.camera_index}) is already connected.")
+                raise RobotDeviceAlreadyConnectedError(f"ImageClient is already connected.")
 
             self.img_client = ImageClient(
                 tv_img_shape=self.tv_img_shape,
                 tv_img_shm_name=self.tv_img_shm.name,
-                wrist_img_shape=self.wrist_img_shape,
-                wrist_img_shm_name=self.wrist_img_shm.name if self.wrist_img_shm else None,
+                left_wrist_img_shape=self.left_wrist_img_shape,
+                left_wrist_img_shm_name=self.left_wrist_img_shm.name if self.left_wrist_img_shm else None,
+                right_wrist_img_shape=self.right_wrist_img_shape,
+                right_wrist_img_shm_name=self.right_wrist_img_shm.name if self.right_wrist_img_shm else None,
+                server_address=self.server_address,
+                head_port=self.head_zmq_port,
+                left_wrist_port=self.left_wrist_zmq_port,
+                right_wrist_port=self.right_wrist_zmq_port,
             )
 
             image_receive_thread = threading.Thread(target=self.img_client.receive_process, daemon=True)
@@ -273,20 +351,20 @@ class ImageClientCamera:
                     "ImageClient is not connected. Try running `camera.connect()` first."
                 )
             current_tv_image = self.tv_img_array.copy()
-            current_wrist_image = self.wrist_img_array.copy() if self.has_wrist_camera else None
+            current_left_wrist_image = self.left_wrist_img_array.copy() if self.left_wrist_img_array is not None else None
+            current_right_wrist_image = self.right_wrist_img_array.copy() if self.right_wrist_img_array is not None else None
 
             colors = {}
             if self.is_binocular:
                 colors["cam_left_high"] = current_tv_image[:, : self.tv_img_shape[1] // 2]
                 colors["cam_right_high"] = current_tv_image[:, self.tv_img_shape[1] // 2 :]
-                if self.has_wrist_camera:
-                    colors["cam_left_wrist"] = current_wrist_image[:, : self.wrist_img_shape[1] // 2]
-                    colors["cam_right_wrist"] = current_wrist_image[:, self.wrist_img_shape[1] // 2 :]
             else:
                 colors["cam_high"] = current_tv_image
-                if self.has_wrist_camera:
-                    colors["cam_left_wrist"] = current_wrist_image[:, : self.wrist_img_shape[1] // 2]
-                    colors["cam_right_wrist"] = current_wrist_image[:, self.wrist_img_shape[1] // 2 :]
+
+            if current_left_wrist_image is not None:
+                colors["cam_left_wrist"] = current_left_wrist_image
+            if current_right_wrist_image is not None:
+                colors["cam_right_wrist"] = current_right_wrist_image
 
             return colors
 
@@ -306,15 +384,18 @@ class ImageClientCamera:
             self.tv_img_shm.close()
         except FileNotFoundError:
             pass
-        if self.has_wrist_camera and self.wrist_img_shm is not None:
-            try:
-                self.wrist_img_shm.unlink()
-            except FileNotFoundError:
-                pass
-            try:
-                self.wrist_img_shm.close()
-            except FileNotFoundError:
-                pass
+
+        for shm in [self.left_wrist_img_shm, self.right_wrist_img_shm]:
+            if shm is not None:
+                try:
+                    shm.unlink()
+                except FileNotFoundError:
+                    pass
+                try:
+                    shm.close()
+                except FileNotFoundError:
+                    pass
+
         self.is_connected = False
 
     def __del__(self):

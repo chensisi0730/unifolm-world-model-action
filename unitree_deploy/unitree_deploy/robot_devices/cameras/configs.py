@@ -120,6 +120,12 @@ class ImageClientCameraConfig(CameraConfig):
     wrist_camera_id_numbers: list[int] | None = None
     wrist_camera_image_shape: list[int] | None = None
 
+    head_zmq_port: int = 55555
+    left_wrist_zmq_port: int = 55556
+    right_wrist_zmq_port: int = 55557
+
+    server_address: str = "192.168.0.109"
+
     aspect_ratio_threshold: float = 2.0
     fps: int = 30
     mock: bool = False

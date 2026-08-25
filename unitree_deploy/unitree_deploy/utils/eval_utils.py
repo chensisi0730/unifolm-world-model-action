@@ -104,8 +104,7 @@ class LongConnectionClient:
             "encoded": "{\"observations\": [{\"full_image\": numpy_array, \"state\": numpy_array, \"instruction\": str}]}"
         }
         
-        Server returns action array of shape (25 timesteps, 23 dims) for G1 tasks.
-        We return the first timestep's action as the prediction to execute.
+        Server returns an action chunk of shape (25 timesteps, 23 dims) for G1 tasks.
         
         Args:
             language_instruction: Task description string.
@@ -114,46 +113,56 @@ class LongConnectionClient:
             gripper_left_q: Current left gripper joint value.
             gripper_right_q: Current right gripper joint value.
         """
-        # Extract the latest observation from batch queues
-        state = list(batch["observation.state"])[-1]  # most recent frame
-        image = list(batch["observation.images.top"])[-1]  # most recent image
-        
-        # Convert tensors to numpy for JSON serialization
-        # Image: (C, H, W) -> (H, W, C), values in [0, 255] uint8
-        if image.dim() == 3:
-            img_np = image.permute(1, 2, 0).cpu().numpy()
-            # Ensure uint8 format for VLA server
-            if img_np.dtype != np.uint8:
-                if img_np.min() < 0 or img_np.max() <= 1.0:
-                    img_np = (img_np * 255).astype(np.uint8)
+        def _state_to_23d(state_tensor: torch.Tensor) -> np.ndarray:
+            state_np = state_tensor.detach().cpu().numpy().astype(np.float64)
+            if arm_ik is not None and len(state_np) in (14, 16):
+                arm_q = state_np[:14]
+                gripper_l = float(state_np[14]) if len(state_np) > 14 else gripper_left_q
+                gripper_r = float(state_np[15]) if len(state_np) > 15 else gripper_right_q
+                return arm_ik.joints_to_ee_proprio_23d(
+                    arm_q=arm_q,
+                    gripper_left_q=gripper_l,
+                    gripper_right_q=gripper_r,
+                )
+            return state_np
+
+        def _chw_to_hwc_uint8(image_tensor: torch.Tensor) -> np.ndarray:
+            image_np = image_tensor.detach().cpu().numpy()
+            if image_np.ndim == 3 and image_np.shape[0] == 3:
+                image_np = np.transpose(image_np, (1, 2, 0))
+            if image_np.dtype != np.uint8:
+                if image_np.min() < 0 or image_np.max() <= 1.0:
+                    image_np = (image_np * 255).astype(np.uint8)
                 else:
-                    img_np = img_np.astype(np.uint8)
-        
-        # State: proprioception - convert joint angles to 23D EE proprio via FK
-        state_np = state.cpu().numpy().astype(np.float64)
-        
-        if arm_ik is not None and len(state_np) in (14, 16):
-            # Extract arm joints (first 14D) and gripper values (if 16D)
-            arm_q = state_np[:14]
-            gripper_l = float(state_np[14]) if len(state_np) > 14 else gripper_left_q
-            gripper_r = float(state_np[15]) if len(state_np) > 15 else gripper_right_q
-            state_23d = arm_ik.joints_to_ee_proprio_23d(
-                arm_q=arm_q,
-                gripper_left_q=gripper_l,
-                gripper_right_q=gripper_r,
-            )
-        else:
-            state_23d = state_np
-        
-        logging.debug(f"Image: dtype={img_np.dtype}, shape={img_np.shape}, range=[{img_np.min()}, {img_np.max()}]")
-        logging.debug(f"State: shape={state_23d.shape}, values={[round(float(x),3) for x in state_23d[:6]]}...")
-        
-        # Build VLA server request format with raw numpy arrays
-        observations = [{
-            "full_image": img_np,       # HxWx3 numpy array
-            "state": state_23d,         # 23D proprioception numpy array
-            "instruction": language_instruction,
-        }]
+                    image_np = image_np.astype(np.uint8)
+            return image_np
+
+        image_seq = list(batch["observation.images.top"])
+        left_wrist_seq = list(batch.get("observation.images.left_wrist", []))
+        right_wrist_seq = list(batch.get("observation.images.right_wrist", []))
+        state_seq = list(batch["observation.state"])
+
+        state_np = np.stack([_state_to_23d(s) for s in state_seq], axis=0)
+
+        logging.debug(
+            f"Image history: steps={len(image_seq)}, top_shape={tuple(image_seq[-1].shape)}"
+        )
+        logging.debug(
+            f"State history: shape={state_np.shape}, latest={[round(float(x), 3) for x in state_np[-1][:6]]}..."
+        )
+
+        observations = []
+        for idx, (image, state) in enumerate(zip(image_seq, state_np)):
+            observation = {
+                "full_image": _chw_to_hwc_uint8(image),
+                "state": state,
+                "instruction": language_instruction,
+            }
+            if idx < len(left_wrist_seq):
+                observation["left_wrist_image"] = _chw_to_hwc_uint8(left_wrist_seq[idx])
+            if idx < len(right_wrist_seq):
+                observation["right_wrist_image"] = _chw_to_hwc_uint8(right_wrist_seq[idx])
+            observations.append(observation)
         
         inner_payload = {"observations": observations}
         
@@ -165,18 +174,10 @@ class LongConnectionClient:
         endpoint = "/act"
         response = self.send_post(endpoint, data)
         
-        # VLA server returns action array of shape (25 timesteps, 23 dims) for G1 tasks
-        # Response may already be numpy array (from json_numpy) or nested list
+        # VLA server returns an action chunk, typically shape (25, 23) for G1 tasks.
         action_np = np.array(response, dtype=np.float32)
         logging.debug(f"VLA returned action shape: {action_np.shape}")
-        
-        # Return the first timestep's action as prediction to execute now
-        if action_np.ndim == 2 and action_np.shape[0] > 1:
-            action = torch.tensor(action_np[0]).float()  # First step only
-        else:
-            action = torch.tensor(action_np).float()
-        
-        return action
+        return torch.tensor(action_np).float()
 
 
 class ACTTemporalEnsembler:

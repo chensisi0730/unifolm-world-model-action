@@ -320,7 +320,7 @@ class G1_29_ArmIK:
     def rotation_to_r6(self, rot_matrix: np.ndarray) -> np.ndarray:
         """
         Convert a 3x3 rotation matrix to 6D rotation representation.
-        R6 = first two rows of the rotation matrix, flattened.
+        R6 = first two columns of the rotation matrix, flattened.
 
         Args:
             rot_matrix: 3x3 rotation matrix
@@ -328,7 +328,7 @@ class G1_29_ArmIK:
         Returns:
             np.ndarray of shape (6,)
         """
-        return rot_matrix[:2, :].flatten()
+        return rot_matrix[:, :2].T.reshape(-1)
 
     def joints_to_ee_proprio_23d(
         self,
@@ -416,7 +416,7 @@ class G1_29_ArmIK:
     def _r6_to_rotation(self, r6: np.ndarray) -> np.ndarray:
         """
         Convert 6D rotation representation back to a 3x3 rotation matrix.
-        Uses Gram-Schmidt orthogonalization on the first two rows.
+        Uses Gram-Schmidt orthogonalization on the first two columns.
 
         Args:
             r6: np.ndarray of shape (6,) - flattened first two rows of rotation matrix.
@@ -436,4 +436,4 @@ class G1_29_ArmIK:
         # r3 = r1 x r2
         r3 = np.cross(r1, r2)
 
-        return np.stack([r1, r2, r3], axis=0)
+        return np.stack([r1, r2, r3], axis=1)

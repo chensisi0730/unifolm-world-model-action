@@ -127,10 +127,14 @@ def g1_image_client_default_factory():
         "imageclient": ImageClientCameraConfig(
             head_camera_type="opencv",
             head_camera_id_numbers=[4],
-            head_camera_image_shape=[480, 640],  # Head camera resolution
-            wrist_camera_type=None,
-            wrist_camera_id_numbers=None,
-            wrist_camera_image_shape=None,
+            head_camera_image_shape=[480, 640],
+            wrist_camera_type="opencv",
+            wrist_camera_id_numbers=[0, 2],
+            wrist_camera_image_shape=[480, 640],
+            head_zmq_port=55555,
+            left_wrist_zmq_port=55556,
+            right_wrist_zmq_port=55557,
+            server_address="192.168.0.109",
             aspect_ratio_threshold=2.0,
             fps=30,
             mock=False,
