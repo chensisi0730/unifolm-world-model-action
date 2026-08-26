@@ -1,3 +1,4 @@
+import subprocess
 import threading
 import time
 from typing import Callable
@@ -80,6 +81,24 @@ class G1_29_ArmController:
         thread.start()
         return thread
 
+    def _detect_robot_net_iface(self) -> str:
+        """Auto-detect the local NIC on the robot's 192.168.123.x subnet for DDS."""
+        try:
+            out = subprocess.check_output(
+                ["ip", "-4", "-o", "addr", "show", "scope", "global"], text=True, timeout=5
+            )
+            for line in out.splitlines():
+                parts = line.split()
+                if len(parts) >= 4:
+                    iface, addr = parts[1], parts[3].split("/")[0]
+                    if addr.startswith("192.168.123."):
+                        log_info(f"[G1_29_ArmController] DDS interface auto-detected: {iface} ({addr})")
+                        return iface
+        except Exception as e:
+            log_warning(f"[G1_29_ArmController] NIC auto-detect failed: {e}")
+        log_warning("[G1_29_ArmController] No 192.168.123.x iface found, falling back to 'eno2'")
+        return "eno2"
+
     def connect(self):
         try:
             if self.is_connected:
@@ -92,7 +111,7 @@ class G1_29_ArmController:
                 time.sleep(1)
             else:
                 # initialize lowcmd publisher and lowstate subscriber
-                ChannelFactoryInitialize(0, 'eno2')
+                ChannelFactoryInitialize(0, self._detect_robot_net_iface())
                 self.lowcmd_publisher = ChannelPublisher(self.topic_low_command, LowCmd_)
                 self.lowcmd_publisher.Init()
                 self.lowstate_subscriber = ChannelSubscriber(self.topic_low_state, LowState_)
@@ -269,6 +288,14 @@ class G1_29_ArmController:
 
             if arm_cmd == "drive_to_waypoint":
                 self._drive_to_waypoint(target_pose=arm_q_target, t_insert_time=0.8)
+                # Hold the reached pose via schedule_waypoint so that a new
+                # write_arm() takes effect within one control period instead of
+                # being blocked by repeated 0.8s drive_to_waypoint windows.
+                with self.ctrl_lock:
+                    if self.arm_cmd == "drive_to_waypoint":
+                        self.arm_cmd = "schedule_waypoint"
+                        self.q_target = arm_q_target
+                        self.time_target = time.perf_counter() + self.control_dt
 
             elif arm_cmd == "schedule_waypoint":
                 self._schedule_waypoint(

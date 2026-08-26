@@ -343,7 +343,7 @@ class G1_29_ArmIK:
 
         23D layout:
             [0-2]   Left EEF XYZ position
-            [3-8]   Left EEF R6 rotation (first two rows of rotation matrix, flattened)
+            [3-8]   Left EEF R6 rotation (first two columns of rotation matrix, flattened)
             [9-11]  Right EEF XYZ position
             [12-17] Right EEF R6 rotation
             [18]    Right gripper open/close
@@ -419,7 +419,7 @@ class G1_29_ArmIK:
         Uses Gram-Schmidt orthogonalization on the first two columns.
 
         Args:
-            r6: np.ndarray of shape (6,) - flattened first two rows of rotation matrix.
+            r6: np.ndarray of shape (6,) - flattened first two columns of rotation matrix.
 
         Returns:
             np.ndarray of shape (3,3) - orthogonal rotation matrix.

@@ -2,7 +2,6 @@ import argparse
 import logging
 import os
 import time
-import cv2
 import numpy as np
 import torch
 import tqdm
@@ -53,9 +52,9 @@ CAM_KEY = {
 def prepare_observation(args: argparse.Namespace, obs: Any) -> OrderedDict:
     """
     Convert a raw env observation into the model's expected input dict.
+    NOTE: env._get_obs() already converted images BGR->RGB; do NOT convert again.
     """
-    rgb_image = cv2.cvtColor(
-        obs.observation["images"][CAM_KEY[args.robot_type]], cv2.COLOR_BGR2RGB)
+    rgb_image = obs.observation["images"][CAM_KEY[args.robot_type]]
     observation = {
         "observation.images.top":
         torch.from_numpy(rgb_image).permute(2, 0, 1),
@@ -63,10 +62,10 @@ def prepare_observation(args: argparse.Namespace, obs: Any) -> OrderedDict:
         torch.from_numpy(obs.observation["qpos"]),
     }
     if "cam_left_wrist" in obs.observation["images"]:
-        left_wrist = cv2.cvtColor(obs.observation["images"]["cam_left_wrist"], cv2.COLOR_BGR2RGB)
+        left_wrist = obs.observation["images"]["cam_left_wrist"]
         observation["observation.images.left_wrist"] = torch.from_numpy(left_wrist).permute(2, 0, 1)
     if "cam_right_wrist" in obs.observation["images"]:
-        right_wrist = cv2.cvtColor(obs.observation["images"]["cam_right_wrist"], cv2.COLOR_BGR2RGB)
+        right_wrist = obs.observation["images"]["cam_right_wrist"]
         observation["observation.images.right_wrist"] = torch.from_numpy(right_wrist).permute(2, 0, 1)
     return OrderedDict(observation)
 
@@ -79,17 +78,19 @@ def run_policy(
     cond_obs_queues: MutableMapping[str, Deque[torch.Tensor]],
     output_dir: Path,
     arm_ik: Any = None,
+    reset_to_init: bool = True,
 ) -> None:
     """
     Single rollout loop:
-        1) warm start the robot,
+        1) warm start the robot (first rollout only),
         2) stream observations,
         3) fetch actions from the policy server,
         4) execute with temporal ensembling for smoother control.
     """
 
-    _ = env.step(INIT_POSE[args.robot_type])
-    time.sleep(2.0)
+    if reset_to_init:
+        _ = env.step(INIT_POSE[args.robot_type])
+        time.sleep(2.0)
     t = 0
 
     while t < args.exe_steps:
@@ -113,9 +114,19 @@ def run_policy(
         )
         
         # Map VLA 23D output chunk -> robot 16D joint-space action chunk.
+        # Keep ALL predicted steps: the temporal ensembler requires the input
+        # length to equal its chunk_size (the model's full prediction window),
+        # so cross-prediction ensembling actually works.
         actions_23d_np = pred_actions_23d.cpu().numpy()
         if actions_23d_np.ndim == 1:
             actions_23d_np = actions_23d_np[None, :]
+        if actions_23d_np.shape[0] > args.model_chunk_size:
+            actions_23d_np = actions_23d_np[:args.model_chunk_size]
+        elif actions_23d_np.shape[0] < args.model_chunk_size:
+            logging.warning(
+                f"VLA returned {actions_23d_np.shape[0]} steps < model_chunk_size "
+                f"{args.model_chunk_size}; temporal ensembling degraded for this cycle."
+            )
 
         robot_actions = []
         current_arm_q = obs["observation.state"][:14].cpu().numpy().astype(np.float64)
@@ -127,7 +138,29 @@ def run_policy(
                 gripper_left_q=gripper_left_q,
                 gripper_right_q=gripper_right_q,
             )
-        for idx, action_23d_np in enumerate(actions_23d_np[:args.action_horizon]):
+        # Print current EE proprio from IK FK (diagnostic)
+        if current_proprio_23d is not None:
+            logging.info(
+                "  Current EE proprio: "
+                f"L_xyz={[f'{x:.3f}' for x in current_proprio_23d[0:3]]}, "
+                f"R_xyz={[f'{x:.3f}' for x in current_proprio_23d[9:12]]}"
+            )
+
+        # Print 25-step EE trajectory range for this chunk (diagnostic for arm amplitude)
+        if len(actions_23d_np) > 0 and actions_23d_np.shape[1] >= 23:
+            left_xyz_all = actions_23d_np[:, 0:3]
+            right_xyz_all = actions_23d_np[:, 9:12]
+            logging.info(
+                "  VLA 25-step EE range: "
+                f"L_xyz min={[f'{x:.3f}' for x in left_xyz_all.min(0)]}, "
+                f"max={[f'{x:.3f}' for x in left_xyz_all.max(0)]}, "
+                f"span={[f'{x:.3f}' for x in left_xyz_all.max(0)-left_xyz_all.min(0)]}; "
+                f"R_xyz min={[f'{x:.3f}' for x in right_xyz_all.min(0)]}, "
+                f"max={[f'{x:.3f}' for x in right_xyz_all.max(0)]}, "
+                f"span={[f'{x:.3f}' for x in right_xyz_all.max(0)-right_xyz_all.min(0)]}"
+            )
+
+        for idx, action_23d_np in enumerate(actions_23d_np):
             env_action_dim = len(INIT_POSE[args.robot_type])  # 16
             if arm_ik is not None and len(action_23d_np) == 23:
                 sol_q, _ = arm_ik.ee_proprio_23d_to_arm_ik(
@@ -170,7 +203,7 @@ def run_policy(
         pred_actions = torch.from_numpy(np.stack(robot_actions, axis=0)).unsqueeze(0)
         logging.debug(f"VLA returned {pred_actions_23d.shape} -> mapped to robot actions {pred_actions.shape}")
 
-        actions = temporal_ensembler.update(pred_actions[:, :args.action_horizon])[0]
+        actions = temporal_ensembler.update(pred_actions)[0]
 
         for n in range(min(args.exe_steps - t, actions.shape[0])):
             action = actions[n].cpu().numpy()
@@ -181,6 +214,13 @@ def run_policy(
             obs = env.step(action)
             time.sleep(max(0, 1 / args.control_freq - time.time() + t1))
             t += 1
+            actual_q = obs.observation["qpos"][:14]
+            logging.info(
+                f"Executing step {t}: sent_arm_q[:4]={np.round(action[:4], 3)}, "
+                f"actual_q[:4]={np.round(actual_q[:4], 3)}, "
+                f"gripper_L={action[14]:.3f}, gripper_R={action[15]:.3f}"
+            )
+            print(f">>> Exec => step {t} action: gripper_L={action[14]:.3f}, R={action[15]:.3f}", flush=True)
 
             obs_for_queue = prepare_observation(args, obs)
             cond_obs_queues = populate_queues(cond_obs_queues, obs_for_queue)
@@ -223,14 +263,24 @@ def run_eval(args: argparse.Namespace) -> None:
 
     try:
         for episode_idx in tqdm.tqdm(range(0, args.num_rollouts_planned)):
+            # chunk_size must equal the model's prediction window (e.g. 25 for
+            # G1_EE_6D), NOT the number of executed steps, otherwise the
+            # ensembler degenerates into pass-through (exe_steps == chunk_size
+            # makes actions[:, :-exe_steps] empty).
+            if args.exe_steps >= args.model_chunk_size:
+                logging.warning(
+                    f"exe_steps ({args.exe_steps}) >= model_chunk_size "
+                    f"({args.model_chunk_size}): temporal ensemble is inactive."
+                )
             temporal_ensembler = ACTTemporalEnsembler(temporal_ensemble_coeff=0.01,
-                                                      chunk_size=args.action_horizon,
+                                                      chunk_size=args.model_chunk_size,
                                                       exe_steps=args.exe_steps)
             cond_obs_queues = make_cond_obs_queues()
             output_dir = Path(args.output_dir) / f"episode_{episode_idx:03d}"
             output_dir.mkdir(parents=True, exist_ok=True)
             run_policy(args, env, client, temporal_ensembler, cond_obs_queues,
-                       output_dir, arm_ik=arm_ik)
+                       output_dir, arm_ik=arm_ik,
+                       reset_to_init=(episode_idx == 0))
     finally:
         env.close()
 
@@ -254,6 +304,13 @@ def get_parser() -> argparse.ArgumentParser:
         type=int,
         default=16,
         help="Number of future actions, predicted by the policy, to keep",
+    )
+    parser.add_argument(
+        "--model_chunk_size",
+        type=int,
+        default=25,
+        help="Full action-chunk length returned by the VLA model "
+             "(G1_EE_6D: 25). Temporal ensemble uses this as its window.",
     )
     parser.add_argument(
         "--exe_steps",

@@ -142,28 +142,35 @@ class LongConnectionClient:
         right_wrist_seq = list(batch.get("observation.images.right_wrist", []))
         state_seq = list(batch["observation.state"])
 
-        state_np = np.stack([_state_to_23d(s) for s in state_seq], axis=0)
+        # The model was trained with window_size=1 and 3 camera views
+        # (primary, left_wrist, right_wrist), i.e. exactly 3 images per sample.
+        # Send ONLY the latest frame so the server-side reassembly
+        # ([all full_images...] + [all wrist images...]) yields
+        # [top, left_wrist, right_wrist] - matching the training distribution.
+        latest_image = _chw_to_hwc_uint8(image_seq[-1])
+        latest_state = _state_to_23d(state_seq[-1])
+
+        observation = {
+            "full_image": latest_image,
+            "state": latest_state,
+            "instruction": language_instruction,
+        }
+        if left_wrist_seq:
+            observation["left_wrist_image"] = _chw_to_hwc_uint8(left_wrist_seq[-1])
+        if right_wrist_seq:
+            observation["right_wrist_image"] = _chw_to_hwc_uint8(right_wrist_seq[-1])
 
         logging.debug(
-            f"Image history: steps={len(image_seq)}, top_shape={tuple(image_seq[-1].shape)}"
+            f"Image: top_shape={latest_image.shape}, "
+            f"left_wrist={'yes' if left_wrist_seq else 'no'}, "
+            f"right_wrist={'yes' if right_wrist_seq else 'no'}"
         )
         logging.debug(
-            f"State history: shape={state_np.shape}, latest={[round(float(x), 3) for x in state_np[-1][:6]]}..."
+            f"State: shape={latest_state.shape}, values={[round(float(x), 3) for x in latest_state[:6]]}..."
         )
 
-        observations = []
-        for idx, (image, state) in enumerate(zip(image_seq, state_np)):
-            observation = {
-                "full_image": _chw_to_hwc_uint8(image),
-                "state": state,
-                "instruction": language_instruction,
-            }
-            if idx < len(left_wrist_seq):
-                observation["left_wrist_image"] = _chw_to_hwc_uint8(left_wrist_seq[idx])
-            if idx < len(right_wrist_seq):
-                observation["right_wrist_image"] = _chw_to_hwc_uint8(right_wrist_seq[idx])
-            observations.append(observation)
-        
+        observations = [observation]
+
         inner_payload = {"observations": observations}
         
         # Use double-encode: serialize inner payload with json_numpy to preserve numpy arrays,

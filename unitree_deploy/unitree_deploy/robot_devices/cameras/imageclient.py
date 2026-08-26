@@ -52,6 +52,7 @@ class ImageClient:
                    network jitter, frame loss rate and other information.
         """
         self.running = True
+        self._stream_threads = []
         self._image_show = image_show
         self._server_address = server_address
         self._head_port = head_port
@@ -163,6 +164,9 @@ class ImageClient:
     def _receive_stream(self, port, img_shape, shm_array_func, label):
         """Single camera ZMQ receive loop running in its own thread."""
         sock = self._context.socket(zmq.SUB)
+        # Keep only the newest JPEG frame for low-latency control.
+        sock.setsockopt(zmq.CONFLATE, 1)
+        sock.setsockopt(zmq.RCVTIMEO, 200)
         sock.connect(f"tcp://{self._server_address}:{port}")
         sock.setsockopt_string(zmq.SUBSCRIBE, "")
         self._sockets.append(sock)
@@ -170,7 +174,10 @@ class ImageClient:
         log_warning(f"[{label}] Connected to port {port}, waiting for data...")
         try:
             while self.running:
-                message = sock.recv()
+                try:
+                    message = sock.recv()
+                except zmq.Again:
+                    continue
                 receive_time = time.time()
 
                 if self._enable_performance_eval:
@@ -243,6 +250,8 @@ class ImageClient:
                       "RightWristCamera"),
                 daemon=True)
             threads.append(t)
+
+        self._stream_threads = threads
 
         for t in threads:
             t.start()
@@ -332,7 +341,7 @@ class ImageClientCamera:
             )
 
             image_receive_thread = threading.Thread(target=self.img_client.receive_process, daemon=True)
-            image_receive_thread.daemon = True
+            self._image_receive_thread = image_receive_thread
             image_receive_thread.start()
 
             self.is_connected = True
@@ -368,15 +377,27 @@ class ImageClientCamera:
 
             return colors
 
+        except RobotDeviceNotConnectedError:
+            raise
         except Exception as e:
-            self.disconnect()
-            log_error(f"❌ Error in ImageClientCamera.async_read: {e}")
+            # Transient read errors must NOT tear down the connection;
+            # keep the receiver threads alive and retry on the next call.
+            log_error(f"❌ Error in ImageClientCamera.async_read (connection kept): {e}")
+            return None
 
     def disconnect(self):
         if not self.is_connected:
             return
 
         try:
+            # Stop receiver loops and wait for them to leave shared-memory writes
+            # before unlinking the backing segments.
+            if self.img_client is not None:
+                self.img_client.running = False
+            receive_thread = getattr(self, "_image_receive_thread", None)
+            if receive_thread is not None and receive_thread is not threading.current_thread():
+                receive_thread.join(timeout=2.0)
+
             self.tv_img_shm.unlink()
         except FileNotFoundError:
             pass
