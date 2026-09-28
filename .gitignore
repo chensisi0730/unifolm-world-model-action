@@ -128,3 +128,6 @@ Data/Pretrained
 Data/utils.py
 Experiment/checkpoint
 Experiment/log
+*.npz
+events.jsonl
+.gitignore
